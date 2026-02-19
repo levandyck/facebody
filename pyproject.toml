@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "facebody"
+version = "0.1.0"
+description = "Face/body analyses"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "pandas",
+  "scipy",
+  "scikit-learn",
+  "torch",
+  "torchvision",
+  "h5py",
+  "matplotlib",
+  "statsmodels",
+  "joblib",
+  "tqdm",
+  "tqdm-joblib",
+  "Pillow",
+  "nibabel",
+  "requests",
+  "PyYAML",
+  "myutils @ git+https://github.com/levandyck/myutils",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["facebody*"]
