@@ -272,7 +272,7 @@ class DNNfloc:
 
         return {"is_exclusive": is_exclusive}
 
-    def find_sel_units(self, activs: dict, labels: np.ndarray, save: bool=True,
+    def find_sel_units(self, activs: dict, labels: np.ndarray,
                        check_exclusivity: bool=True):
         """
         Identify selective units using baseline approach with mutual exclusivity.
@@ -399,13 +399,11 @@ class DNNfloc:
                 print(f"Violated in: {violated_layers}")
             print("="*60 + "\n")
 
-        if save:
-            save_dir = PROJECT_ROOT / "selectivity" / self.model_name
-            save_dir.mkdir(parents=True, exist_ok=True)
-            save_pickle(res, save_dir / "floc_res.pkl")
-            print(f"\nResults saved to: {save_dir / 'floc_res.pkl'}")
-        else:
-            return res
+        save_dir = PROJECT_ROOT / "selectivity" / self.model_name
+        save_dir.mkdir(parents=True, exist_ok=True)
+        fname = save_dir / "floc_res.pkl"
+        save_pickle(res, fname)
+        print(f"\nResults saved to: {save_dir / 'floc_res.pkl'}")
 
 
 # ----------------------------------- Utils ---------------------------------- #

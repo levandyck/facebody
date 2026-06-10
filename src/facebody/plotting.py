@@ -1,3 +1,4 @@
+from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr, t as t_dist
@@ -5,7 +6,6 @@ import statsmodels.formula.api as smf
 import matplotlib.pyplot as plt
 import matplotlib.lines as mlines
 import matplotlib.patches as mpatches
-from matplotlib.patches import Rectangle
 import matplotlib.cm as cm
 
 from facebody.config import PROJECT_ROOT, FIG_ROOT
@@ -25,8 +25,6 @@ plt.rcParams.update({
     "figure.dpi": 300
 })
 
-MODEL_STYLES = ["-", "--"]
-
 SEL_INFO = {
     "face": {"label": "Face-selective", "color": "#dc267fff"},
     "body": {"label": "Body-selective", "color": "#ffb000ff"},
@@ -36,265 +34,255 @@ SEL_INFO = {
 
 # ------------------------------- MAIN FIGURES ------------------------------- #
 # -------------------------------- Selectivity ------------------------------- #
-def plot_perc_layers(model_names, model_names_legend, layers,
-                     fig_title=None, out_path=None):
+def plot_perc_layers(model_dict: dict, fig_title: str=None, ylim: tuple=(0, 8),
+                     n_grid: int=10, out_path: Path=None):
     """Line plot: Percentage of selective units across layers."""
     sel_types = list(SEL_INFO.keys())[:3]
+    fig, ax = plt.subplots(figsize=(7.5, 3.8))
 
-    fig, ax = plt.subplots(figsize=(7, 3.5))
-    x = np.arange(len(layers))
+    get_layers = lambda model, i: model_dict[model]
 
-    for m, model in enumerate(model_names):
+    # Shared normalized layer depth grid
+    x_grid = np.linspace(0, 1, n_grid)
+
+    # Store interpolated curves for each unit type
+    all_curves = {sel: [] for sel in sel_types}
+
+    for m, model in enumerate(model_dict.keys()):
+        layers = get_layers(model, m)
         res = load_pickle(PROJECT_ROOT / "selectivity" / model / "floc_res.pkl")
 
-        # Total units per layer
-        totals = np.array([len(res[lay]["stats"]["face"]["dvals"]) for lay in layers], dtype=float)
+        x_model = np.linspace(0, 1, len(layers))
 
-        # Percent selective per layer
-        data = {}
-        for sel in sel_types:
-            counts = np.array([len(res[lay]["unit_ids"].get(sel, [])) for lay in layers], dtype=float)
-            data[sel] = np.divide(100.0 * counts, totals, out=np.full_like(totals, np.nan), where=totals != 0)
+        totals = np.array(
+            [len(res[lay]["stats"]["face"]["dvals"]) for lay in layers],
+            dtype=float
+        )
 
-        # Plot each selective unit type
         for sel in sel_types:
-            ax.plot(
-                x, data[sel],
-                color=SEL_INFO[sel]["color"],
-                ls=MODEL_STYLES[m],
-                alpha=0.8
+            counts = np.array(
+                [len(res[lay]["unit_ids"].get(sel, [])) for lay in layers],
+                dtype=float
+            )
+            vec = np.divide(
+                100.0 * counts,
+                totals,
+                out=np.full_like(totals, np.nan),
+                where=totals != 0
             )
 
-        # Compute and print stats
-        print(f"{model}: Spearman r of proportion and layer depth")
-        for sel in sel_types:
-            vec = np.array(data[sel], dtype=float)
             ok = ~np.isnan(vec)
-            rho, p = spearmanr(x[ok], vec[ok])
-            max_val = np.nanmax(vec)
-            mean_val = np.nanmean(vec)
+            if ok.sum() < 2:
+                interp_vec = np.full_like(x_grid, np.nan, dtype=float)
+            else:
+                interp_vec = np.interp(
+                    x_grid,
+                    x_model[ok],
+                    vec[ok],
+                )
 
-            # Mean for fc layers only
-            fc_mask = np.array(['fc' in lay for lay in layers])
-            mean_fc = np.nanmean(vec[fc_mask]) if fc_mask.any() else np.nan
+            all_curves[sel].append(interp_vec)
 
-            print(f"{sel}: r={rho:.2f}, p={p:.3f}, max={max_val:.2f}%, mean={mean_val:.2f}%, mean_fc={mean_fc:.2f}%")
+    # Aggregate and plot
+    for sel in sel_types:
+        arr = np.vstack(all_curves[sel])
+        n = arr.shape[0]
+        mean_vec = np.nanmean(arr, axis=0)
+        sem_vec = np.nanstd(arr, axis=0, ddof=1) / np.sqrt(n)
 
-    ax.set_xticks(x)
-    ax.set_xticklabels(layers, rotation=30, ha="right")
-    ax.set_ylim(0, 12)
+        ax.plot(
+            x_grid*100,
+            mean_vec,
+            color=SEL_INFO[sel]["color"],
+            lw=2.5,
+            label=SEL_INFO[sel]["label"],
+        )
+        ax.fill_between(
+            x_grid*100,
+            mean_vec - sem_vec,
+            mean_vec + sem_vec,
+            color=SEL_INFO[sel]["color"],
+            alpha=0.2,
+            linewidth=0,
+        )
+
+        ok = ~np.isnan(mean_vec)
+        rho, p = spearmanr(x_grid[ok], mean_vec[ok]) if ok.sum() > 1 else (np.nan, np.nan)
+        print(f"{sel}: Model mean Spearman r={rho:.2f}, p={p:.3f}")
+
+    ax.set_xlim(-5, 105)
+    ax.set_xticks(np.linspace(0, 100, 5))
+    ax.set_xticklabels([f"{v:.0f}" for v in np.linspace(0, 100, 5)])
+    ax.set_xlabel("Layer depth (%)")
+    ax.set_ylim(*ylim)
     ax.set_ylabel("Selective units (%)")
     clean_axes(ax)
 
-    # Legend
-    # Models
-    model_handles = [
-        mlines.Line2D([], [], color="gray", ls=MODEL_STYLES[m])
-        for m, _ in enumerate(model_names_legend)
-    ]
-    leg1 = ax.legend(
-        model_handles, model_names_legend,
-        title="Model", # Dataset
-        loc="center left",
-        bbox_to_anchor=(1, 0.7),
-        frameon=False)
-    leg1._legend_box.align = "left"
-    ax.add_artist(leg1)
-
-    # Unit types
     sel_handles = [
-        mlines.Line2D([], [], color=SEL_INFO[sel]["color"])
+        mlines.Line2D([], [], color=SEL_INFO[sel]["color"], lw=2.5)
         for sel in sel_types
     ]
     sel_labels = [SEL_INFO[sel]["label"] for sel in sel_types]
-    leg2 = ax.legend(
-        sel_handles, sel_labels,
+    leg = ax.legend(
+        sel_handles,
+        sel_labels,
         title="Unit type",
         loc="center left",
-        bbox_to_anchor=(1, 0.2),
-        frameon=False)
-    leg2._legend_box.align = "left"
+        bbox_to_anchor=(1, 0.5),
+        frameon=False,
+    )
+    leg._legend_box.align = "left"
 
     ax.set_title(fig_title)
     plt.tight_layout()
+
     if out_path is not None:
-        plt.savefig(FIG_ROOT / out_path, dpi=300)
+        plt.savefig(FIG_ROOT / out_path, dpi=300, bbox_inches="tight")
     plt.show()
 
-def plot_dprime_dist(model_names, model_names_legend, layers,
-                     fig_title=None, out_path=None):
+def plot_dprime_dist(model_dict: dict, fig_title: str=None, out_path: Path=None,
+                     ylims: tuple=(-2, 2.5), n_boot: int=1000):
     """Violin plot: Face and body selectivity per unit type."""
     sel_types = list(SEL_INFO.keys())
-    sel_labels = [SEL_INFO[sel]["label"] for sel in sel_types]
 
-    stats_data = {
-        model: {
-            sel: {"face": {}, "body": {}}
-            for sel in sel_types + ["nonselective"]
-        }
-        for model in model_names_legend
+    pooled = {
+        sel: {"face": [], "body": []}
+        for sel in sel_types
     }
 
-    rows = []
-    for model, model_legend in zip(model_names, model_names_legend):
+    hier_data = {
+        sel: {"face": {}, "body": {}}
+        for sel in sel_types
+    }
+
+    for model in model_dict.keys():
         res = load_pickle(PROJECT_ROOT / "selectivity" / model / "floc_res.pkl")
         dvals = load_pickle(PROJECT_ROOT / "selectivity" / model / "validation_dprime.pkl")
 
-        for lay in layers:
-            dvals_f = np.array(dvals[lay]["face_d"])
-            dvals_b = np.array(dvals[lay]["body_d"])
-            all_u = dvals_f.shape[0]
+        for lay in model_dict[model]:
+            dvals_f = np.asarray(dvals[lay]["face_d"], dtype=float)
+            dvals_b = np.asarray(dvals[lay]["body_d"], dtype=float)
+            all_units = np.arange(dvals_f.shape[0])
 
             groups = {
-                sel: np.asarray(res[lay]["unit_ids"].get(sel, np.array([], dtype=int)), dtype=int)
+                sel: np.asarray(res[lay]["unit_ids"].get(sel, []), dtype=int)
                 for sel in sel_types
+                if sel != "nonselective"
             }
-            sel_u = np.concatenate(list(groups.values()))
-            groups["nonselective"] = np.setdiff1d(np.arange(all_u), sel_u)
+
+            used = [ids for ids in groups.values() if ids.size > 0]
+            used = np.concatenate(used) if used else np.array([], dtype=int)
+            groups["nonselective"] = np.setdiff1d(all_units, used)
 
             for sel, ids in groups.items():
                 if ids.size == 0:
                     continue
-                unit_label = SEL_INFO[sel]["label"]
 
-                # Store by layer for hierarchical bootstrap
-                stats_data[model_legend][sel]["face"][lay] = dvals_f[ids]
-                stats_data[model_legend][sel]["body"][lay] = dvals_b[ids]
+                vals = {
+                    "face": dvals_f[ids],
+                    "body": dvals_b[ids],
+                }
 
-                # For violin plot
-                rows.extend([(unit_label, "Face d'", float(v), model_legend) for v in dvals_f[ids]])
-                rows.extend([(unit_label, "Body d'", float(v), model_legend) for v in dvals_b[ids]])
+                for key, dvals_arr in (("face", dvals_f), ("body", dvals_b)):
+                    arr = dvals_arr[ids]
+                    arr = arr[~np.isnan(arr)]
+                    if arr.size == 0:
+                        continue
 
-    df = pd.DataFrame(rows, columns=["unit_type", "selectivity", "dprime", "model"])
+                    pooled[sel][key].append(arr)
+                    hier_data[sel][key].setdefault(model, {})[lay] = arr
 
-    # Require two models for split violin
-    models_present = df["model"].unique().tolist()
-    if len(models_present) != 2:
-        raise ValueError("Requires exactly two distinct models for split violin.")
+    rng = np.random.default_rng(0)
 
-    model1, model2 = model_names_legend
-    if set(models_present) != {model1, model2}:
-        raise ValueError("model_names_legend must match the two models present in df.")
-    n_types = len(sel_types)
+    fig, (ax_face, ax_body) = plt.subplots(1, 2, figsize=(8, 2.8), sharey=True)
 
-    # Split df
-    df_face = df[df["selectivity"] == "Face d'"].copy()
-    df_body = df[df["selectivity"] == "Body d'"].copy()
+    def _plot_panel(ax, key, title, rng):
+        pos, data, sels = [], [], []
 
-    fig, (ax_face, ax_body) = plt.subplots(1, 2, figsize=(6, 2.5), sharey=False)
-    y_min, y_max = -1.5, 2.0
+        for i, sel in enumerate(sel_types):
+            # Violin data
+            if pooled[sel][key]:
+                vals = np.concatenate(pooled[sel][key])
+                vals = vals[~np.isnan(vals)]
+                if vals.size > 0:
+                    pos.append(i)
+                    data.append(vals)
+                    sels.append(sel)
 
-    width = 0.8
-    half_w = width / 2.0
-    offsets = {model1: -half_w / 2.0, model2: +half_w / 2.0}
-
-    for ax, subset_df, title in zip((ax_face, ax_body), (df_face, df_body), ("Face d'", "Body d'")):
-        for s, lab in enumerate(sel_labels):
-            base_color = SEL_INFO[sel_types[s]]["color"]
-
-            vals1 = subset_df[
-                (subset_df["unit_type"] == lab) & (subset_df["model"] == model1)
-            ]["dprime"].values
-            vals2 = subset_df[
-                (subset_df["unit_type"] == lab) & (subset_df["model"] == model2)
-            ]["dprime"].values
-
-            # Clip rectangles
-            clip_left = Rectangle(
-                (s - half_w, y_min - 1e-3),
-                half_w,
-                (y_max - y_min) + 2e-3,
-                transform=ax.transData
+            # Hierarchical bootstrap CI
+            grand_mean, ci_lo, ci_hi = compute_mean_ci_hierarch_models_layers_units(
+                hier_data[sel][key], n_iter=n_boot, rng=rng,
             )
-            clip_right = Rectangle(
-                (s, y_min - 1e-3),
-                half_w,
-                (y_max - y_min) + 2e-3,
-                transform=ax.transData
+            if not np.isfinite(grand_mean):
+                continue
+
+            ax.errorbar(
+                i, grand_mean,
+                yerr=[[grand_mean - ci_lo], [ci_hi - grand_mean]],
+                fmt="o",
+                color="darkgray",
+                markerfacecolor="darkgray",
+                markeredgecolor="darkgray",
+                capsize=3,
+                markersize=4,
+                zorder=5,
             )
 
-            # Left half: filled
-            if vals1.size > 0:
-                parts1 = ax.violinplot(
-                    vals1, positions=[s], widths=width,
-                    showmeans=False, showmedians=False, showextrema=False
-                )
-                for body in parts1["bodies"]:
-                    body.set_facecolor(base_color)
-                    body.set_edgecolor(None)
-                    body.set_alpha(1.0) # 0.8
-                    body.set_clip_path(clip_left)
-
-            # Right half: hatched
-            if vals2.size > 0:
-                parts2 = ax.violinplot(
-                    vals2, positions=[s], widths=width,
-                    showmeans=False, showmedians=False, showextrema=False
-                )
-                for body in parts2["bodies"]:
-                    body.set_facecolor("none")
-                    body.set_edgecolor(base_color)
-                    body.set_hatch("///")
-                    body.set_alpha(1.0) # 0.8
-                    body.set_clip_path(clip_right)
-
-            # Overlay means & CIs
-            for mdl, vals in ((model1, vals1), (model2, vals2)):
-                if vals.size == 0:
-                    continue
-
-                # Get stats
-                sel_type = sel_types[s]
-                if title == "Face d'":
-                    layer_dict = stats_data[mdl][sel_type]["face"]
-                else:
-                    layer_dict = stats_data[mdl][sel_type]["body"]
-
-                m_val, ci = compute_mean_ci_hierarch(layer_dict, n_iter=5000)
-
-                ax.errorbar(
-                    s + offsets[mdl], m_val,
-                    yerr=ci,
-                    fmt="o",
-                    color="darkgray",
-                    capsize=3,
-                    markersize=4,
-                    zorder=5,
-                )
+        if data:
+            vp = ax.violinplot(
+                data,
+                positions=pos,
+                widths=0.8,
+                showmeans=False,
+                showmedians=False,
+                showextrema=False,
+            )
+            for body, sel in zip(vp["bodies"], sels):
+                body.set_facecolor(SEL_INFO[sel]["color"])
+                body.set_edgecolor(SEL_INFO[sel]["color"])
+                body.set_linewidth(0)
+                body.set_alpha(1)
 
         ax.set_title(title)
-        ax.set_xlabel("")
         ax.set_xticks([])
-        ax.set_xlim(-0.6, n_types - 0.4)
         ax.axhline(0, color="gray", ls="--", lw=1, zorder=0)
-        ax.set_ylabel("Selectivity (d')" if title == "Face d'" else "")
-        ax.set_ylim(y_min, y_max)
+        ax.set_xlim(-0.6, len(sel_types) - 0.4)
+        ax.set_ylim(*ylims)
         ax.grid(False)
         clean_axes(ax)
 
-    # Legend for models
-    model_handles = [
-        mlines.Line2D([], [], marker="s", ls="none", color="gray"),
-        mlines.Line2D([], [], marker="s", ls="none", color="lightgray")
+    rng = np.random.default_rng(0)
+    _plot_panel(ax_face, "face", "Face d'", rng)
+    _plot_panel(ax_body, "body", "Body d'", rng)
+
+    ax_face.set_ylabel("Selectivity (d')")
+
+    handles = [
+        mlines.Line2D([], [], color=SEL_INFO[sel]["color"], lw=3)
+        for sel in sel_types
     ]
+    labels = [SEL_INFO[sel]["label"] for sel in sel_types]
+
     ax_body.legend(
-        model_handles, model_names_legend,
-        title="Model",
+        handles,
+        labels,
+        title="Unit type",
         loc="center left",
         bbox_to_anchor=(1, 0.5),
-        frameon=False
+        frameon=False,
     )
 
     plt.suptitle(fig_title)
     plt.tight_layout()
+
     if out_path:
-        plt.savefig(FIG_ROOT / out_path, dpi=300)
+        plt.savefig(FIG_ROOT / out_path, dpi=300, bbox_inches="tight")
     plt.show()
 
-def plot_guided_gradcam(model_name, target_layer, cam_layer=None,
-                        controlled=True, device="cuda",
-                        img_path=None, n_imgs=3, norm_types=True, seed=None,
-                        fig_title=None, out_path=None):
+def plot_guided_gradcam(model_name: str, target_layer: str, cam_layer: str=None,
+                        controlled: bool=True, device: str="cuda",
+                        img_path: str=None, n_imgs: int=3, norm_types: bool=True,
+                        seed: int=None, fig_title: str=None, out_path: Path=None):
     """Heatmaps: Guided Grad-CAM saliency map per unit type overlaid on example images."""
     sel_types = list(SEL_INFO.keys())
 
@@ -372,8 +360,9 @@ def plot_guided_gradcam(model_name, target_layer, cam_layer=None,
 
 
 # --------------------------------- Encoding --------------------------------- #
-def plot_encoding_sep(model_name, layer, rois, r2_adj=False,
-                      fig_title=None, out_path=None):
+def plot_encoding_sep(model_name: str, layer: str, rois: list,
+                      r2_adj: bool=False, gap: float=0.5,
+                      fig_title: str=None, out_path: Path=None):
     """Bar plot: Mean R² of unit types per ROI."""
     res = load_pickle(PROJECT_ROOT / "encoding" / model_name / "sep.pkl")[layer]
     fmri = load_pickle(PROJECT_ROOT / "nsd" / "fmri_activs.pkl")
@@ -382,11 +371,16 @@ def plot_encoding_sep(model_name, layer, rois, r2_adj=False,
     sel_keys = ["f", "b", "m", "ns"]
     sel_key_map = dict(zip(sel_types, sel_keys))
 
+    if rois and not isinstance(rois[0], list):
+        rois = [rois]
+
+    flat_rois = [roi for group in rois for roi in group]
+
     # Collect per-subject scores
-    scores = {roi: {sel: [] for sel in sel_types} for roi in rois}
+    scores = {roi: {sel: [] for sel in sel_types} for roi in flat_rois}
     for subj, roi_map in res.items():
         subj_fmri = fmri.get(subj, {})
-        for roi in rois:
+        for roi in flat_rois:
             metrics = roi_map.get(roi)
             fmri_roi = subj_fmri.get(roi)
             if not metrics or fmri_roi is None:
@@ -404,21 +398,31 @@ def plot_encoding_sep(model_name, layer, rois, r2_adj=False,
 
     # Fixed-effects within-subject means + 95% CI half-widths
     ci_data = {}
-    for roi in rois:
+    for roi in flat_rois:
         data = np.stack([scores[roi][sel] for sel in sel_types], axis=1)
         valid = ~np.isnan(data).any(axis=1)
         ci_data[roi] = compute_mean_ci(data[valid])
 
+    # Build x positions
+    x_positions = []
+    cursor = 0.0
+    for g, group in enumerate(rois):
+        for roi in group:
+            x_positions.append(cursor)
+            cursor += 1.0
+        if g < len(rois) - 1:
+            cursor += gap
+    x = np.array(x_positions)
+
     # Plotting
-    fig, ax = plt.subplots(figsize=(8, 4))
-    x = np.arange(len(rois))
+    fig, ax = plt.subplots(figsize=(10, 4))
     width = 0.2
     offsets = (np.arange(len(sel_types)) - (len(sel_types) - 1) / 2) * width
 
     # Noise ceiling ribbon
     if not r2_adj:
         total = width * len(sel_types)
-        for i, roi in enumerate(rois):
+        for i, roi in enumerate(flat_rois):
             nc_vals = [
                 np.nanmean(roi_dict["ncsnr"])
                 for s in res
@@ -426,14 +430,14 @@ def plot_encoding_sep(model_name, layer, rois, r2_adj=False,
             ]
             if nc_vals:
                 lo, hi = np.percentile(nc_vals, [2.5, 97.5])
-                ax.fill_between([i - total / 2, i + total / 2], lo, hi,
+                ax.fill_between([x[i] - total / 2, x[i] + total / 2], lo, hi,
                                 color="gray", alpha=0.3, lw=0)
 
     # Grouped bars and subject means
     for idx, sel in enumerate(sel_types):
         pos = x + offsets[idx]
-        means = [ci_data[r][0][idx] for r in rois]
-        errs = [ci_data[r][1][idx] for r in rois]
+        means = [ci_data[r][0][idx] for r in flat_rois]
+        errs = [ci_data[r][1][idx] for r in flat_rois]
 
         info = SEL_INFO[sel]
         ax.bar(
@@ -444,7 +448,7 @@ def plot_encoding_sep(model_name, layer, rois, r2_adj=False,
             label=info["label"],
         )
 
-        for j, roi in enumerate(rois):
+        for j, roi in enumerate(flat_rois):
             vals = scores[roi][sel]
             if vals:
                 ax.scatter([pos[j]] * len(vals), vals, color="gray", alpha=0.5, s=5)
@@ -453,7 +457,7 @@ def plot_encoding_sep(model_name, layer, rois, r2_adj=False,
     ax.set_title(fig_title)
     ax.set_ylabel("Explained variance (R² adj.)" if r2_adj else "Explained variance (R²)")
     ax.set_xticks(x)
-    ax.set_xticklabels(rois, rotation=30, ha='right')
+    ax.set_xticklabels(flat_rois, rotation=30, ha='right')
     clean_axes(ax)
 
     # Legend
@@ -476,8 +480,10 @@ def plot_encoding_sep(model_name, layer, rois, r2_adj=False,
         plt.savefig(FIG_ROOT / out_path, dpi=300)
     plt.show()
 
-def plot_encoding_varpart(model_name, layer, rois, r2_adj=False, show_delta=True,
-                          fig_title=None, out_path=None):
+def plot_encoding_varpart(model_name: str, layer: str, rois: list,
+                          r2_adj: bool=False, show_delta: bool=True,
+                          gap: float=0.5, fig_title: str=None,
+                          out_path: Path=None):
     """Bar plot: Mean R² components of unit types per ROI."""
     res_fb = load_pickle(PROJECT_ROOT / "encoding" / model_name / "fb_varpart.pkl")[layer]
     subjects = list(res_fb.keys())
@@ -489,16 +495,21 @@ def plot_encoding_varpart(model_name, layer, rois, r2_adj=False, show_delta=True
     labels = ["Face", "Body", "Face ∩ Body"] + (["Δ Mixed"] if show_delta else [])
     colors = [SEL_INFO["face"]["color"],
               SEL_INFO["body"]["color"],
-              "#F9CEB0"
+              "#F9CEB0",
     ] + (["#648FFF"] if show_delta else [])
 
-    scores = {roi: {k: {s: np.nan for s in subjects} for k in keys} for roi in rois}
+    if rois and not isinstance(rois[0], list):
+        rois = [rois]
+
+    flat_rois = [roi for group in rois for roi in group]
+
+    scores = {roi: {k: {s: np.nan for s in subjects} for k in keys} for roi in flat_rois}
 
     for subj in subjects:
         fb_map = res_fb.get(subj, {})
         subj_fmri = fmri.get(subj, {})
 
-        for roi in rois:
+        for roi in flat_rois:
             comp = fb_map.get(roi)
             fmri_roi = subj_fmri.get(roi)
             if not comp or fmri_roi is None:
@@ -520,7 +531,7 @@ def plot_encoding_varpart(model_name, layer, rois, r2_adj=False, show_delta=True
 
     # Fixed-effects within-subject means + 95% CI half-widths
     mean_ci = {}
-    for roi in rois:
+    for roi in flat_rois:
         mat = np.vstack([[scores[roi][k][s] for s in subjects] for k in keys]).T
         mat = mat.astype(float)
         valid = ~np.isnan(mat).any(axis=1)
@@ -529,23 +540,30 @@ def plot_encoding_varpart(model_name, layer, rois, r2_adj=False, show_delta=True
         else:
             means = np.full(len(keys), np.nan)
             ci = np.full(len(keys), np.nan)
-        means = np.asarray(means, dtype=float)
-        ci = np.asarray(ci, dtype=float)
-        mean_ci[roi] = (means, ci)
+        mean_ci[roi] = (np.asarray(means, dtype=float), np.asarray(ci, dtype=float))
 
-    # Plot bars
+    # Build x positions with inter-group gaps
+    x_positions = []
+    cursor = 0.0
+    for g, group in enumerate(rois):
+        for roi in group:
+            x_positions.append(cursor)
+            cursor += 1.0
+        if g < len(rois) - 1:
+            cursor += gap
+    x = np.array(x_positions)
+
+    # Bar layout
     n_keys = len(keys)
-    x = np.arange(len(rois))
     width = 0.8 / n_keys
-    spacing = width
-    offsets = (np.arange(n_keys) - (n_keys-1)/2) * spacing
+    offsets = (np.arange(n_keys) - (n_keys - 1) / 2) * width
 
-    fig, ax = plt.subplots(figsize=(8, 4))
+    fig, ax = plt.subplots(figsize=(10, 4))
 
     # Noise ceiling
     if not r2_adj:
         total_w = 0.8
-        for i, roi in enumerate(rois):
+        for i, roi in enumerate(flat_rois):
             subj_ncs = [
                 np.nanmean(fmri[s][roi]["ncsnr"])
                 for s in fmri
@@ -556,7 +574,7 @@ def plot_encoding_varpart(model_name, layer, rois, r2_adj=False, show_delta=True
             if subj_ncs:
                 lo, hi = np.percentile(subj_ncs, [2.5, 97.5])
                 ax.fill_between(
-                    [i-total_w/2, i+total_w/2],
+                    [x[i] - total_w / 2, x[i] + total_w / 2],
                     lo, hi,
                     color="gray", alpha=0.3, lw=0, zorder=0
                 )
@@ -564,8 +582,8 @@ def plot_encoding_varpart(model_name, layer, rois, r2_adj=False, show_delta=True
     # Grouped bars and subject means
     for j, (lab, col) in enumerate(zip(labels, colors)):
         pos = x + offsets[j]
-        means = [mean_ci[roi][0][j] for roi in rois]
-        errs = [mean_ci[roi][1][j] for roi in rois]
+        means = [mean_ci[roi][0][j] for roi in flat_rois]
+        errs = [mean_ci[roi][1][j] for roi in flat_rois]
 
         ax.bar(
             pos, means, width,
@@ -574,10 +592,8 @@ def plot_encoding_varpart(model_name, layer, rois, r2_adj=False, show_delta=True
             error_kw={"elinewidth": 1.5, "ecolor": "dimgray"},
         )
 
-        # Per-subject dots
         k = keys[j]
-        for ri, roi in enumerate(rois):
-            # vals = [v for v in scores[roi][k] if np.isfinite(v)]
+        for ri, roi in enumerate(flat_rois):
             vals = [scores[roi][k][s] for s in subjects]
             vals = [v for v in vals if np.isfinite(v)]
             if vals:
@@ -585,7 +601,7 @@ def plot_encoding_varpart(model_name, layer, rois, r2_adj=False, show_delta=True
 
     ax.set_ylim(0, None)
     ax.set_xticks(x)
-    ax.set_xticklabels(rois, rotation=30, ha="right")
+    ax.set_xticklabels(flat_rois, rotation=30, ha="right")
     ax.set_ylabel("Explained variance (R² adj.)" if r2_adj else "R²")
     clean_axes(ax)
     fig.suptitle(fig_title)
@@ -599,7 +615,7 @@ def plot_encoding_varpart(model_name, layer, rois, r2_adj=False, show_delta=True
         title="Variance portion",
         loc="center left",
         bbox_to_anchor=(1, 0.5),
-        frameon=False
+        frameon=False,
     )
     leg._legend_box.align = "left"
 
@@ -608,12 +624,12 @@ def plot_encoding_varpart(model_name, layer, rois, r2_adj=False, show_delta=True
         plt.savefig(FIG_ROOT / out_path, dpi=300)
     plt.show()
 
-def plot_varpart_integrated(model_name, layers,
-                            face_rois=("OFA", "FFA", "aTL-faces"),
-                            body_rois=("EBA", "FBA", "mTL-bodies"),
-                            r2_adj=False, include_delta=True,
-                            show_group_mean=True, fig_title=None,
-                            out_path=None):
+def plot_varpart_integrated(model_name: str, layers: list,
+                            face_rois: tuple=("OFA", "FFA", "aTL-faces"),
+                            body_rois: tuple=("EBA", "FBA", "mTL-bodies"),
+                            r2_adj: bool=False, include_delta: bool=True,
+                            show_group_mean: bool=True, fig_title: str=None,
+                            out_path: Path=None):
     """Line plot: Integrated variance across cortical hierarchy for both region types."""
     if isinstance(layers, str):
         layers = [layers]
@@ -843,8 +859,8 @@ def plot_varpart_integrated(model_name, layers,
 
 
 # --------------------------------- Lesioning -------------------------------- #
-def plot_lesioning_drop(model_name, tasks=("face", "person", "action"), norm_drop=True,
-                        fig_title=None, out_path=None):
+def plot_lesioning_drop(model_name: str, tasks: tuple=("face", "person", "action"),
+                        norm_drop: bool=True, fig_title: str=None, out_path: Path=None):
     """Bar plot: Lesioning drops for different classification tasks."""
     datasets = {
         "face": "Faces",
@@ -903,372 +919,245 @@ def plot_lesioning_drop(model_name, tasks=("face", "person", "action"), norm_dro
     plt.show()
 
 
-# -------------------------------- Integration ------------------------------- #
-def plot_integration_coefs(model_name, layer, coefs=["beta_F", "beta_B", "beta_FB"],
-                           n_boot=10000, random_state=0,
-                           fig_title=None, out_path=None):
-    """Violin plots with bootstrap CIs for a single layer."""
-    sel_types = list(SEL_INFO.keys())
-    colors = {s: SEL_INFO[s]["color"] for s in sel_types}
-
-    coef_labels = {
-        "beta_F": "Face",
-        "beta_B": "Body",
-        "beta_FB": "Interaction",
-    }
-
-    res = load_pickle(PROJECT_ROOT / "fb_integration" / model_name / "fb_integration.pkl")
-
-    # Collect data per type/coefficient for the specified layer
-    data = {coef: {} for coef in coefs}
-    present_types = set()
-
-    layer_dict = res.get(layer, {})
-    for coef in coefs:
-        for s in sel_types:
-            df = layer_dict.get(s)
-            if df is None or df.empty or (coef not in df.columns):
-                continue
-
-            vals = df[coef].to_numpy()
-            vals = vals[np.isfinite(vals)]
-            if vals.size:
-                data[coef][s] = vals
-                present_types.add(s)
-
-    present_types = [s for s in sel_types if s in present_types]
-
-    if not present_types:
-        raise ValueError(f"No coefficient data found for layer {layer}.")
-
-    n_coefs = len(coefs)
-    fig, axes = plt.subplots(1, n_coefs, figsize=(3 * n_coefs, 2.5), sharey=True)
-    if n_coefs == 1:
-        axes = [axes]
-
-    rng = np.random.default_rng(random_state)
-
-    for ax_idx, (ax, coef) in enumerate(zip(axes, coefs)):
-
-        # Bootstrap per sel_type
-        violin_data = []
-        means = []
-        medians = []
-        cis_lower = []
-        cis_upper = []
-        x_pos = []
-
-        for si, sel in enumerate(present_types):
-            vals = data[coef].get(sel)
-            if vals is None or vals.size == 0:
-                continue
-
-            # Bootstrap the mean for this selectivity type
-            boot_means = np.zeros(n_boot)
-            for b in range(n_boot):
-                boot_sample = rng.choice(vals, size=len(vals), replace=True)
-                boot_means[b] = np.mean(boot_sample)
-
-            boot_means = boot_means[np.isfinite(boot_means)]
-            violin_data.append(boot_means)
-            means.append(np.mean(boot_means))
-            medians.append(np.median(boot_means))
-            cis_lower.append(np.percentile(boot_means, 2.5))
-            cis_upper.append(np.percentile(boot_means, 97.5))
-
-            x_pos.append(si)
-
-        if not violin_data:
-            continue
-
-        # Violin plot
-        parts = ax.violinplot(
-            violin_data,
-            positions=x_pos,
-            widths=0.5,
-            showmeans=False,
-            showmedians=False,
-            showextrema=False,
-        )
-
-        # Color violins by sel_type
-        for pc, sel in zip(parts["bodies"], present_types):
-            pc.set_facecolor(colors[sel])
-            pc.set_edgecolor("none")
-            pc.set_alpha(1)
-
-        # Error bars + median dots
-        ax.errorbar(
-            x_pos,
-            means,
-            [[m - lo for m, lo in zip(means, cis_lower)],
-             [hi - m for m, hi in zip(means, cis_upper)]],
-            fmt="none",
-            capsize=2,
-            elinewidth=1.5,
-            ecolor="dimgray",
-            zorder=3,
-        )
-        ax.scatter(x_pos, medians, s=12, color="dimgray", zorder=4)
-        ax.set_ylim(-0.5, 1.7)
-        ax.axhline(0, color="gray", ls="--", lw=0.8, zorder=0)
-        ax.set_title(coef_labels[coef], fontsize=10)
-        if ax_idx == 0:
-            ax.set_ylabel("Coefficient (β)")
-        ax.set_xticks([])
-        clean_axes(ax)
-
-    if fig_title:
-        fig.suptitle(fig_title)
-    plt.tight_layout()
-
-    if out_path:
-        plt.savefig(FIG_ROOT / out_path, dpi=300)
-    plt.show()
-
-
 # --------------------------- SUPPLEMENTARY FIGURES -------------------------- #
-def plot_perc_layers_mixed(model_names, model_names_legend, layers, ylim=(0, 5),
-                           fig_title=None, out_path=None):
+def plot_perc_layers_mixed(model_dict: dict, fig_title: str=None, ylim: tuple=(0, 5),
+                           n_grid: int=10, out_path: Path=None):
     """Line plot: Percentage of selective units across layers (mixed selectivity)."""
-    # Define mixed selectivity types and colors
     mixed_sel_types = ["face&body", "face&scene", "body&scene"]
     mixed_sel_info = {
-        "face&body": {"color": "#648FFF", "label": "Face & Body"},
+        "face&body":  {"color": "#648FFF", "label": "Face & Body"},
         "face&scene": {"color": "#AE3ECC", "label": "Face & Scene"},
-        "body&scene": {"color": "#00C43E", "label": "Body & Scene"}
+        "body&scene": {"color": "#00C43E", "label": "Body & Scene"},
     }
 
     fig, ax = plt.subplots(figsize=(7, 3.5))
-    x = np.arange(len(layers))
 
-    for m, model in enumerate(model_names):
-        res = load_pickle(PROJECT_ROOT / "selectivity_mixed" / model / "floc_res.pkl")
+    get_layers = lambda model, i: model_dict[model]
 
-        # Total units per layer
-        totals = np.array([len(res[lay]["stats"]["face"]["dvals"]) for lay in layers], dtype=float)
+    # Shared normalized layer depth grid
+    x_grid = np.linspace(0, 1, n_grid)
 
-        # Percent selective per layer
-        data = {}
+    # Store interpolated curves for each mixed sel type
+    all_curves = {sel: [] for sel in mixed_sel_types}
+
+    for m, model in enumerate(model_dict.keys()):
+        layers = get_layers(model, m)
+        res = load_pickle(PROJECT_ROOT / "selectivity" / model / "floc_res_mixed.pkl")
+
+        x_model = np.linspace(0, 1, len(layers))
+        totals = np.array(
+            [len(res[lay]["stats"]["face"]["dvals"]) for lay in layers],
+            dtype=float,
+        )
+
         for sel in mixed_sel_types:
-            counts = np.array([len(res[lay]["unit_ids"].get(sel, [])) for lay in layers], dtype=float)
-            data[sel] = np.divide(100.0 * counts, totals, out=np.full_like(totals, np.nan), where=totals != 0)
-
-        # Plot each mixed selective unit type
-        for sel in mixed_sel_types:
-            ax.plot(
-                x, data[sel],
-                color=mixed_sel_info[sel]["color"],
-                ls=MODEL_STYLES[m],
-                alpha=0.8
+            counts = np.array(
+                [len(res[lay]["unit_ids"].get(sel, [])) for lay in layers],
+                dtype=float,
+            )
+            vec = np.divide(
+                100.0 * counts,
+                totals,
+                out=np.full_like(totals, np.nan),
+                where=totals != 0,
             )
 
-        # Compute and print Spearman correlation and max percentage
-        print(f"{model}: Spearman r of proportion and layer depth")
-        for sel in mixed_sel_types:
-            vec = np.array(data[sel], dtype=float)
             ok = ~np.isnan(vec)
-            rho, p = spearmanr(x[ok], vec[ok])
-            max_val = np.nanmax(vec)
-            print(f"{sel}: r={rho:.2f}, p={p:.3f}, max={max_val:.2f}%")
+            if ok.sum() < 2:
+                interp_vec = np.full_like(x_grid, np.nan, dtype=float)
+            else:
+                interp_vec = np.interp(x_grid, x_model[ok], vec[ok])
 
-    ax.set_xticks(x)
-    ax.set_xticklabels(layers, rotation=30, ha="right")
+            all_curves[sel].append(interp_vec)
+
+    # Aggregate and plot
+    for sel in mixed_sel_types:
+        arr = np.vstack(all_curves[sel])
+        n = arr.shape[0]
+        mean_vec = np.nanmean(arr, axis=0)
+        sem_vec = np.nanstd(arr, axis=0, ddof=1) / np.sqrt(n)
+
+        ax.plot(
+            x_grid * 100,
+            mean_vec,
+            color=mixed_sel_info[sel]["color"],
+            lw=2.5,
+            label=mixed_sel_info[sel]["label"],
+        )
+        ax.fill_between(
+            x_grid * 100,
+            mean_vec - sem_vec,
+            mean_vec + sem_vec,
+            color=mixed_sel_info[sel]["color"],
+            alpha=0.2,
+            linewidth=0,
+        )
+
+        ok = ~np.isnan(mean_vec)
+        rho, p = spearmanr(x_grid[ok], mean_vec[ok]) if ok.sum() > 1 else (np.nan, np.nan)
+        max_val = np.nanmax(mean_vec)
+        print(f"{sel}: r={rho:.2f}, p={p:.3f}, max={max_val:.2f}%")
+
+    ax.set_xlim(-5, 105)
+    ax.set_xticks(np.linspace(0, 100, 5))
+    ax.set_xticklabels([f"{v:.0f}" for v in np.linspace(0, 100, 5)])
+    ax.set_xlabel("Layer depth (%)")
     ax.set_ylim(ylim)
     ax.set_ylabel("Selective units (%)")
     clean_axes(ax)
 
-    # Legend
-    # Models
-    model_handles = [
-        mlines.Line2D([], [], color="gray", ls=MODEL_STYLES[m])
-        for m, _ in enumerate(model_names_legend)
-    ]
-    leg1 = ax.legend(
-        model_handles, model_names_legend,
-        title="Model",
-        loc="center left",
-        bbox_to_anchor=(1, 0.7),
-        frameon=False)
-    leg1._legend_box.align = "left"
-    ax.add_artist(leg1)
-
-    # Unit types
     sel_handles = [
-        mlines.Line2D([], [], color=mixed_sel_info[sel]["color"])
+        mlines.Line2D([], [], color=mixed_sel_info[sel]["color"], lw=2.5)
         for sel in mixed_sel_types
     ]
     sel_labels = [mixed_sel_info[sel]["label"] for sel in mixed_sel_types]
-    leg2 = ax.legend(
-        sel_handles, sel_labels,
+    leg = ax.legend(
+        sel_handles,
+        sel_labels,
         title="Unit type",
         loc="center left",
-        bbox_to_anchor=(1, 0.2),
-        frameon=False)
-    leg2._legend_box.align = "left"
+        bbox_to_anchor=(1, 0.5),
+        frameon=False,
+    )
+    leg._legend_box.align = "left"
 
     ax.set_title(fig_title)
     plt.tight_layout()
+
     if out_path is not None:
-        plt.savefig(FIG_ROOT / out_path, dpi=300)
+        plt.savefig(FIG_ROOT / out_path, dpi=300, bbox_inches="tight")
     plt.show()
 
-def plot_dprime_layers(model_names, layers, img_db="validation",
-                       fig_title=None, subplot_titles=None, out_path=None):
-    """Line plot: Mean d' for each unit type across layers."""
+def plot_dprime_layers(model_dict: dict, img_db: str="validation",
+                       fig_title: str=None, ylim: tuple=(-0.5, 1),
+                       out_path: Path=None):
+    """Line plot: Mean d' for each unit type across layers (mean ± SEM across models)."""
     sel_types = list(SEL_INFO.keys())[:3]
     type_colors = [SEL_INFO[sel]["color"] for sel in sel_types]
-    ds_linestyles = {"ecoset": "-", "imagenet": "--"}
 
     if img_db not in ("floc", "validation"):
         raise ValueError(f"img_db must be 'floc' or 'validation', got {img_db!r}")
 
+    # Shared normalized layer depth grid
+    n_grid = 10
+    x_grid = np.linspace(0, 1, n_grid)
+
     # Load validation d' if necessary
     val_data = {}
     if img_db == "validation":
-        for model in model_names:
+        for model in model_dict.keys():
             val_data[model] = load_pickle(PROJECT_ROOT / "selectivity" / model / "validation_dprime.pkl")
 
-    nplots = 1 if not subplot_titles else len(subplot_titles)
-    fig, axes = plt.subplots(1, nplots, figsize=(6*nplots, 5), sharey=(nplots>1))
-    if nplots == 1:
-        axes = [axes]
+    # Store interpolated mean-d' curves per model per sel type
+    all_curves = {sel: [] for sel in sel_types}
 
-    # Split models across subplots
-    groups = np.array_split(model_names, 2) if nplots == 2 else [model_names]
+    for model in model_dict.keys():
+        layers = model_dict[model]
+        res = load_pickle(PROJECT_ROOT / "selectivity" / model / "floc_res.pkl")
 
-    # Plot each group
-    x = np.arange(len(layers))
-    titles = (subplot_titles or [fig_title])
+        x_model = np.linspace(0, 1, len(layers))
 
-    for ax, group, title in zip(axes, groups, titles):
-        for model in group:
-            res = load_pickle(PROJECT_ROOT / "selectivity" / model / "floc_res.pkl")
+        # Compute per-layer mean d' for each sel type
+        means_per_sel = {sel: [] for sel in sel_types}
+        for lay in layers:
+            sel_ids = res[lay]["unit_ids"]
 
-            # Decide linestyle from model name
-            low = model.lower()
-            if "ecoset" in low:
-                ds = "ecoset"
-            elif "imagenet" in low:
-                ds = "imagenet"
+            if img_db == "floc":
+                floc_stats = res[lay]["stats"]
+                d_all = {
+                    sel: np.array(floc_stats[sel].get("dvals", []))
+                    for sel in sel_types
+                }
+                for sel in sel_types:
+                    ids = sel_ids.get(sel, [])
+                    if len(ids) > 0 and d_all[sel].size > 0:
+                        m_val, _ = compute_mean_ci(d_all[sel][ids])
+                    else:
+                        m_val = np.nan
+                    means_per_sel[sel].append(m_val)
+
+            else: # Validation
+                vp = val_data.get(model, {})
+                dvals_lay = vp.get(lay, {})
+                d_all = {
+                    "face":  np.asarray(dvals_lay.get("face_d",  [])),
+                    "body":  np.asarray(dvals_lay.get("body_d",  [])),
+                    "mixed": np.asarray(dvals_lay.get("mixed_d", [])),
+                }
+                for sel in sel_types:
+                    ids = np.asarray(sel_ids.get(sel, []), dtype=int)
+                    if ids.size > 0:
+                        m_val, _ = compute_mean_ci(d_all[sel][ids])
+                    else:
+                        m_val = np.nan
+                    means_per_sel[sel].append(m_val)
+
+        # Interpolate each sel type onto shared x_grid
+        for sel in sel_types:
+            vec = np.array(means_per_sel[sel])
+            ok = ~np.isnan(vec)
+            if ok.sum() < 2:
+                interp_vec = np.full_like(x_grid, np.nan, dtype=float)
             else:
-                ds = None
-            ls = ds_linestyles.get(ds, "-")
+                interp_vec = np.interp(x_grid, x_model[ok], vec[ok])
+            all_curves[sel].append(interp_vec)
 
-            # Mean and CI per layer per sel_type
-            stats = {sel: [] for sel in sel_types}
-            for lay in layers:
-                sel_ids = res[lay]["unit_ids"]
+    # Aggregate and plot
+    fig, ax = plt.subplots(figsize=(7, 3.5))
+    ax.axhline(0, color="gray", ls="--", lw=1, zorder=0)
 
-                if img_db == "floc":
-                    # floc_stats = res[lay]["dvals"]
-                    floc_stats = res[lay]["stats"]
-                    d_all = {
-                        # sel: np.array(floc_stats.get(sel, []))
-                        sel: np.array(floc_stats[sel].get("dvals", []))
-                        for sel in sel_types
-                    }
+    for sel, color in zip(sel_types, type_colors):
+        arr = np.vstack(all_curves[sel])
+        n = arr.shape[0]
+        mean_vec = np.nanmean(arr, axis=0)
+        sem_vec  = np.nanstd(arr, axis=0, ddof=1) / np.sqrt(n)
 
-                    for sel in sel_types:
-                        ids = sel_ids.get(sel, [])
-                        if len(ids)>0 and d_all[sel].size>0:
-                            m_val, ci = compute_mean_ci(d_all[sel][ids])
-                        else:
-                            m_val, ci = np.nan, np.nan
-                        stats[sel].append((m_val, ci))
+        ax.plot(x_grid * 100, mean_vec, color=color, lw=2.5)
+        ax.fill_between(
+            x_grid * 100,
+            mean_vec - sem_vec,
+            mean_vec + sem_vec,
+            color=color,
+            alpha=0.2,
+            linewidth=0,
+        )
 
-                else:
-                    vp = val_data.get(model, {})
-                    dvals_lay = vp.get(lay, {})
+        ok = ~np.isnan(mean_vec)
+        rho, p = spearmanr(x_grid[ok], mean_vec[ok]) if ok.sum() > 1 else (np.nan, np.nan)
+        print(f"{sel}: r={rho:.2f}, p={p:.3f}")
 
-                    d_all = {
-                        "face": np.asarray(dvals_lay.get("face_d", [])),
-                        "body": np.asarray(dvals_lay.get("body_d", [])),
-                        "mixed": np.asarray(dvals_lay.get("mixed_d", [])),
-                    }
+    ax.set_xlim(-5, 105)
+    ax.set_xticks(np.linspace(0, 100, 5))
+    ax.set_xticklabels([f"{v:.0f}" for v in np.linspace(0, 100, 5)])
+    ax.set_xlabel("Layer depth (%)")
+    ax.set_ylim(ylim)
+    ax.set_ylabel("Selectivity (d')")
+    clean_axes(ax)
 
-                    for sel in sel_types:
-                        ids = np.asarray(sel_ids.get(sel, []), dtype=int)
-                        if ids.size > 0:
-                            m_val, ci = compute_mean_ci(d_all[sel][ids])
-                        else:
-                            m_val, ci = np.nan, np.nan
-                        stats[sel].append((m_val, ci))
-
-            low = model.lower()
-            if "ecoset" in low: ds = "ecoset"
-            elif "imagenet" in low: ds = "imagenet"
-            else: ds = None
-            ls = ds_linestyles.get(ds, "-")
-
-            # Plot each unit type
-            for sel, color in zip(sel_types, type_colors):
-                means = np.array([m for m,_ in stats[sel]])
-                cis = np.array([c for _,c in stats[sel]])
-
-                ax.plot(x, means, color=color, linestyle=ls, alpha=0.8)
-                ax.fill_between(
-                    x,
-                    means - cis,
-                    means + cis,
-                    color=color,
-                    alpha=0.2,
-                    lw=0
-                )
-
-            # Spearman: depth vs d'
-            print(f"{model}: Spearman r of d' and layer depth")
-            for sel in sel_types:
-                vec = np.array([m for m,_ in stats[sel]])
-                ok = ~np.isnan(vec)
-                if ok.sum()>1:
-                    rho, p = spearmanr(x[ok], vec[ok])
-                    print(f"{sel}: r={rho:.2f}, p={p:.3f}")
-
-        ax.set_title(title)
-        ax.set_xticks(x)
-        ax.set_xticklabels(layers, rotation=30, ha="right")
-        ax.set_ylim(0, 1.5)
-        if ax is axes[0]:
-            ax.set_ylabel("Selectivity (d')")
-        clean_axes(ax)
-
-    # Legend
-    # Datasets
-    ds_handles = [
-        mlines.Line2D([], [], color="gray", ls="-"),
-        mlines.Line2D([], [], color="gray", ls="--")
-    ]
-    ds_labels = ["Ecoset", "ImageNet"]
-    leg1 = ax.legend(ds_handles, ds_labels,
-                     title="Dataset",
-                     loc="upper left",
-                     bbox_to_anchor=(1, 0.8),
-                     frameon=False)
-    leg1._legend_box.align = "left"
-    ax.add_artist(leg1)
-
-    # Unit types
     sel_handles = [
-        mlines.Line2D([], [], color=SEL_INFO[sel]["color"])
+        mlines.Line2D([], [], color=SEL_INFO[sel]["color"], lw=2.5)
         for sel in sel_types
     ]
     sel_labels = [SEL_INFO[sel]["label"] for sel in sel_types]
-    leg2 = ax.legend(
+    leg = ax.legend(
         sel_handles, sel_labels,
         title="Unit type",
         loc="center left",
-        bbox_to_anchor=(1, 0.3),
-        frameon=False)
-    leg2._legend_box.align = "left"
+        bbox_to_anchor=(1, 0.5),
+        frameon=False,
+    )
+    leg._legend_box.align = "left"
 
-    plt.suptitle(fig_title)
+    ax.set_title(fig_title)
+    plt.tight_layout()
+
     if out_path is not None:
-        plt.savefig(FIG_ROOT / out_path, dpi=300)
+        plt.savefig(FIG_ROOT / out_path, dpi=300, bbox_inches="tight")
     plt.show()
 
-def plot_encoding_sep_layers(model_name, layers, rois, r2_adj=False,
-                             fig_title=None, out_path=None):
+def plot_encoding_sep_layers(model_name: str, layers: list, rois: list,
+                             r2_adj: bool=False, fig_title: str=None,
+                             out_path: Path=None):
     """Line plot: Mean R² of unit type across layers per ROI."""
     res = load_pickle(PROJECT_ROOT / "encoding" / model_name / "sep.pkl")
     fmri = load_pickle(PROJECT_ROOT / "nsd" / "fmri_activs.pkl")
@@ -1386,8 +1275,9 @@ def plot_encoding_sep_layers(model_name, layers, rois, r2_adj=False,
         plt.savefig(FIG_ROOT / out_path, dpi=300)
     plt.show()
 
-def plot_encoding_varpart_layers(model_name, layers, rois, r2_adj=False, show_delta=True,
-                                 fig_title=None, out_path=None):
+def plot_encoding_varpart_layers(model_name: str, layers: list, rois: list,
+                                 r2_adj: bool=False, show_delta: bool=True,
+                                 fig_title: str=None, out_path: Path=None):
     """Line plot: Mean R² components (variance partitioning) across layers per ROI."""
     res_fb = load_pickle(PROJECT_ROOT / "encoding" / model_name / "fb_varpart.pkl")
     res_delta = load_pickle(PROJECT_ROOT / "encoding" / model_name / "delta_m.pkl") if show_delta else {}
@@ -1516,201 +1406,78 @@ def plot_encoding_varpart_layers(model_name, layers, rois, r2_adj=False, show_de
         plt.savefig(FIG_ROOT / out_path, dpi=300)
     plt.show()
 
-def plot_integration_coef_layers(model_name, layers,
-                                 coefs=["obs_net_full", "pred_net_headbody", "beta_FB"],
-                                 filt_enhanced=True, n_boot=10000, random_state=0,
-                                 fig_title=None, out_path=None):
-    """Line plots with bootstrap CIs per layer"""
-    sel_types = list(SEL_INFO.keys())
-    labels = {s: SEL_INFO[s]["label"] for s in sel_types}
-    colors = {s: SEL_INFO[s]["color"] for s in sel_types}
-
-    coef_labels = {
-        "obs_net_full": "Observed (Whole)",
-        "pred_net_headbody": "Predicted (Face + Body)",
-        "beta_FB": "Interaction (Enhanced)",
-    }
-
-    res = load_pickle(PROJECT_ROOT / "fb_integration" / model_name / "fb_integration.pkl")
-
-    # Collect data per layer/type/coefficient
-    data = {coef: {lay: {} for lay in layers} for coef in coefs}
-    present_types = set()
-
-    for coef in coefs:
-        for lay in layers:
-            layer_dict = res.get(lay, {})
-            for s in sel_types:
-                df = layer_dict.get(s)
-                if df is None or df.empty or (coef not in df.columns):
-                    continue
-
-                if coef == "beta_FB" and filt_enhanced:
-                    # Only include units that enhance response to whole persons
-                    mask = df["obs_net_full"] > 0
-                    vals = df.loc[mask, coef].to_numpy()
-                else:
-                    vals = df[coef].to_numpy()
-
-                vals = vals[np.isfinite(vals)]
-                if vals.size:
-                    data[coef][lay][s] = vals
-                    present_types.add(s)
-
-    if not present_types:
-        raise ValueError(f"No coefficient values found for the requested layers.")
-
-    present_types = [s for s in sel_types if s in present_types]
-
-    n_coefs = len(coefs)
-    fig, axes = plt.subplots(1, n_coefs, figsize=(3.5 * n_coefs, 3), sharey=False)
-    if n_coefs == 1:
-        axes = [axes]
-    elif n_coefs >= 2:
-        axes[1].sharey(axes[0])
-
-    n_layers = len(layers)
-    base_pos = np.arange(n_layers)
-    rng = np.random.default_rng(random_state)
-
-    for ax_idx, (ax, coef) in enumerate(zip(axes, coefs)):
-        # Bootstrap CIs per layer
-        means = {s: np.full(n_layers, np.nan) for s in present_types}
-        ci_lower = {s: np.full(n_layers, np.nan) for s in present_types}
-        ci_upper = {s: np.full(n_layers, np.nan) for s in present_types}
-        ns = {s: np.zeros(n_layers, dtype=int) for s in present_types}
-
-        for li, lay in enumerate(layers):
-            for s in present_types:
-                vals = data[coef][lay].get(s)
-                if vals is None or vals.size == 0:
-                    continue
-
-                ns[s][li] = vals.size
-
-                boot_means = np.zeros(n_boot)
-                for b in range(n_boot):
-                    boot_sample = rng.choice(vals, size=len(vals), replace=True)
-                    boot_means[b] = np.mean(boot_sample)
-
-                means[s][li] = np.mean(boot_means)
-                ci_lower[s][li] = np.percentile(boot_means, 2.5)
-                ci_upper[s][li] = np.percentile(boot_means, 97.5)
-
-        for s in present_types:
-            xs = base_pos
-            ys = means[s].copy()
-            ys_lower = ci_lower[s].copy()
-            ys_upper = ci_upper[s].copy()
-
-            valid = np.isfinite(ys)
-            if not valid.any():
-                continue
-
-            ax.plot(xs[valid], ys[valid],
-                    linewidth=2,
-                    color=colors[s], alpha=0.8,
-                    label=labels[s] if ax_idx == 0 else None,
-                    zorder=3)
-            ax.fill_between(
-                xs[valid], 
-                ys_lower[valid], 
-                ys_upper[valid],
-                color=colors[s], 
-                alpha=0.3, 
-                linewidth=0,
-                zorder=2
-            )
-
-        ax.axhline(0, color="dimgray", ls="--", lw=0.8, zorder=0)
-        # ax.set_xlim(base_pos[0] - 0.75, base_pos[-1] + 0.75)
-        ax.set_xticks(base_pos)
-        ax.set_xticklabels(layers, rotation=30, ha="right")
-        ax.set_title(coef_labels.get(coef, coef))
-        if ax_idx == 0:
-            ax.set_ylabel("Norm. response")
-        elif ax_idx == 1:
-            ax.set_ylabel("")
-        clean_axes(ax)
-
-    # After all plotting, align zero baseline
-    if n_coefs >= 3:
-        y0_min, y0_max = axes[0].get_ylim()
-        zero_frac = -y0_min / (y0_max - y0_min)
-
-        for ax_idx in range(2, n_coefs):
-            y_min, y_max = axes[ax_idx].get_ylim()
-
-            # Determine minimum required ranges
-            range_below = abs(min(y_min, 0))
-            range_above = max(y_max, 0)
-
-            # Calculate what total range each requirement implies
-            total_range_from_below = range_below / zero_frac
-            total_range_from_above = range_above / (1 - zero_frac)
-
-            # Take the larger to ensure all data fits
-            total_range = max(total_range_from_below, total_range_from_above)
-    
-            new_y_min = -zero_frac * total_range
-            new_y_max = (1 - zero_frac) * total_range
-
-            axes[ax_idx].set_ylim(new_y_min, new_y_max)
-
-    if fig_title:
-        fig.suptitle(fig_title)
-    plt.tight_layout()
-
-    if out_path:
-        plt.savefig(FIG_ROOT / out_path, dpi=300)
-    plt.show()
-
 
 # ----------------------------------- Utils ---------------------------------- #
 def compute_mean_ci(data: np.ndarray, n_iter: int=10000):
-    """Compute mean and 95% CI."""
+    """Compute mean and 95% CI via bootstrapping."""
     if len(data) == 0:
         return np.nan, np.nan
 
-    means = [np.mean(np.random.choice(data, size=len(data), replace=True)) for _ in range(n_iter)]
-    lower = np.percentile(means, 2.5)
-    upper = np.percentile(means, 97.5)
+    n = len(data)
+    boot_means = np.array([
+        np.mean(data[np.random.choice(n, size=n, replace=True)], axis=0)
+        for _ in range(n_iter)
+    ])
+    lower = np.percentile(boot_means, 2.5, axis=0)
+    upper = np.percentile(boot_means, 97.5, axis=0)
     ci = (upper - lower) / 2
 
-    return np.mean(data), ci
+    return np.mean(data, axis=0), ci
 
-def compute_mean_ci_hierarch(data_by_layer: dict, n_iter: int=10000):
-    """Compute mean and 95% CI accounting for layer structure."""
-    all_data = np.concatenate([v for v in data_by_layer.values() if len(v) > 0])
-    if len(all_data) == 0:
-        return np.nan, np.nan
+def compute_mean_ci_hierarch_models_layers_units(
+    models_data: dict,
+    n_iter: int=10000,
+    rng: np.random.Generator=None,
+):
+    """Hierarchical bootstrapping: models → layers → units."""
+    if rng is None:
+        rng = np.random.default_rng()
 
-    layers = list(data_by_layer.keys())
-    if len(layers) == 0:
-        return np.nan
+    model_names = [m for m in models_data if models_data[m]]
+    if not model_names:
+        return np.nan, np.nan, np.nan
 
-    means = []
+    # Precompute a flat list of (layer_data_arrays) per model for speed
+    all_data_flat = np.concatenate([
+        arr
+        for layers in models_data.values()
+        for arr in layers.values()
+        if len(arr) > 0
+    ])
+    grand_mean = float(np.nanmean(all_data_flat))
+
+    boot_means = []
+    n_models = len(model_names)
+
     for _ in range(n_iter):
-        # Resample layers with replacement
-        sampled_layers = np.random.choice(layers, size=len(layers), replace=True)
+        # Level 1: Resample models with replacement
+        sampled_models = rng.choice(n_models, size=n_models, replace=True)
+        iteration_vals = []
 
-        # For each sampled layer, resample units within that layer
-        resampled_values = []
-        for layer in sampled_layers:
-            layer_data = data_by_layer[layer]
-            if len(layer_data) > 0:
-                # Resample units within this layer
-                resampled_units = np.random.choice(layer_data, size=len(layer_data), replace=True)
-                resampled_values.extend(resampled_units)
+        for mi in sampled_models:
+            model = model_names[mi]
+            layer_dict = models_data[model]
+            layer_names = [l for l in layer_dict if len(layer_dict[l]) > 0]
+            if not layer_names:
+                continue
 
-        if len(resampled_values) > 0:
-            means.append(np.mean(resampled_values))
+            # Level 2: Resample layers with replacement
+            n_layers = len(layer_names)
+            sampled_layers = rng.choice(n_layers, size=n_layers, replace=True)
 
-    lower = np.percentile(means, 2.5)
-    upper = np.percentile(means, 97.5)
-    ci = (upper - lower) / 2
+            for li in sampled_layers:
+                units = layer_dict[layer_names[li]]
 
-    return np.mean(all_data), ci
+                # Level 3: Resample units with replacement
+                boot_units = rng.choice(units, size=len(units), replace=True)
+                iteration_vals.append(boot_units)
+
+        if iteration_vals:
+            boot_means.append(np.mean(np.concatenate(iteration_vals)))
+
+    ci_lo = float(np.percentile(boot_means, 2.5))
+    ci_hi = float(np.percentile(boot_means, 97.5))
+    return grand_mean, ci_lo, ci_hi
 
 def compute_mean_ci_within(X: np.ndarray, alpha: float=0.05):
     """Within-subject CI on condition means."""

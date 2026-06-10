@@ -6,54 +6,28 @@ from facebody.selectivity import DNNfloc, compute_sel_dprime
 
 device = "cuda:0"
 
-ALEXNET_LAYERS = ["conv1", "conv2", "conv3", "conv4", "conv5", "fc6", "fc7"]
+ALEXNET_LAYERS = [f"conv{i}" for i in range(1, 6)] + [f"fc{i}" for i in range(6, 8)]
 VGG16_LAYERS = [f"conv{i}" for i in range(1, 14)] + [f"fc{i}" for i in range(14, 16)]
+RESNET50_LAYERS = [f"conv{i}" for i in range(1, 50)]
 
-# ------------------------------ AlexNet models ------------------------------ #
-model_names = [
-    "alexnet_ecoset", "alexnet_imagenet", # Supervised
-    "alexnet-barlow-twins_ecoset", "alexnet-barlow-twins_imagenet", # Self-supervised
-    "alexnet_untrained", "alexnet-barlow-twins_untrained", # Untrained
-]
+# Specify models and layers
+MODEL_DICT = {
+    "alexnet_ecoset": ALEXNET_LAYERS,
+    "alexnet_imagenet": ALEXNET_LAYERS,
+    "alexnet_untrained": ALEXNET_LAYERS,
 
-# Find selective units
-floc_loader = ImageDataLoader(
-    root=DATA_ROOT / "datasets" / "floc",
-    class_names=["face", "body", "scene", "object", "scrambled"],
-)
+    "alexnet-barlow-twins_ecoset": ALEXNET_LAYERS,
+    "alexnet-barlow-twins_imagenet": ALEXNET_LAYERS,
+    "alexnet-barlow-twins_untrained": ALEXNET_LAYERS,
 
-for model in model_names:
-    ml = ModelLoader(model, DATA_ROOT, device)
+    "vgg16_ecoset": VGG16_LAYERS,
+    "vgg16_imagenet": VGG16_LAYERS,
+    "vgg16_untrained": VGG16_LAYERS,
 
-    fe = FeatureExtractor(ml, ALEXNET_LAYERS)
-    activs, labels = fe.extract(floc_loader)
-
-    dnn_floc = DNNfloc(
-        model, ALEXNET_LAYERS,
-        class_to_idx=floc_loader.dataset.class_to_idx,
-        single_cats=["face", "body"],
-        mixed_tuples=[("face", "body")],
-    )
-    dnn_floc.find_sel_units(activs, labels)
-
-# Confirm selectivity (d')
-vl = ImageDataLoader(root=DATA_ROOT / "datasets" / "validation")
-
-for model in model_names:
-    ml = ModelLoader(model, DATA_ROOT, device)
-
-    fe = FeatureExtractor(ml, ALEXNET_LAYERS)
-    activs, labels = fe.extract(vl)
-
-    compute_sel_dprime(model, activs, labels, class_to_idx=vl.dataset.class_to_idx,
-                       img_db="validation", baseline_cat=None)
-
-
-# ------------------------------- VGG16 models ------------------------------- #
-model_names = [
-    "vgg16_ecoset", "vgg16_imagenet", # Supervised
-    "vgg16_untrained", # untrained
-]
+    "resnet50_ecoset": RESNET50_LAYERS,
+    "resnet50_imagenet": RESNET50_LAYERS,
+    "resnet50_untrained": RESNET50_LAYERS,
+}
 
 # Find selective units
 floc_loader = ImageDataLoader(
@@ -61,28 +35,30 @@ floc_loader = ImageDataLoader(
     class_names=["face", "body", "scene", "object", "scrambled"],
 )
 
-for model in model_names:
+for model, layers in MODEL_DICT.items():
     ml = ModelLoader(model, DATA_ROOT, device)
 
-    fe = FeatureExtractor(ml, VGG16_LAYERS)
+    fe = FeatureExtractor(ml, layers)
     activs, labels = fe.extract(floc_loader)
 
     dnn_floc = DNNfloc(
-        model, VGG16_LAYERS,
+        model, layers,
         class_to_idx=floc_loader.dataset.class_to_idx,
         single_cats=["face", "body"],
         mixed_tuples=[("face", "body")],
     )
     dnn_floc.find_sel_units(activs, labels)
 
-# Confirm selectivity (d')
+# Confirm selective units
 vl = ImageDataLoader(root=DATA_ROOT / "datasets" / "validation")
 
-for model in model_names:
+for model, layers in MODEL_DICT.items():
     ml = ModelLoader(model, DATA_ROOT, device)
 
-    fe = FeatureExtractor(ml, VGG16_LAYERS)
+    fe = FeatureExtractor(ml, layers)
     activs, labels = fe.extract(vl)
 
-    compute_sel_dprime(model, activs, labels, class_to_idx=vl.dataset.class_to_idx,
-                       img_db="validation", baseline_cat=None)
+    compute_sel_dprime(
+        model, activs, labels, class_to_idx=vl.dataset.class_to_idx,
+        img_db="validation", baseline_cat="object",
+    )

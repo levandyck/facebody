@@ -12,8 +12,8 @@ device = "cuda:0"
 
 # Specify model, layers, subjects, and rois
 model_name = "alexnet_ecoset"
-layers = ["conv1", "conv2", "conv3", "conv4", "conv5", "fc6", "fc7"]
-subjects = ["subj01", "subj02", "subj03", "subj04", "subj05", "subj06", "subj07", "subj08"]
+layers = [f"conv{i}" for i in range(1, 6)] + [f"fc{i}" for i in range(6, 8)]
+subjects = [f"subj{i:02d}" for i in range(1, 9)]
 rois = ["OFA", "FFA", "aTL-faces", "EBA", "FBA", "mTL-bodies", "FFA&FBA", "V1"]
 
 # Download and preprocess NSD fMRI data
