@@ -1,6 +1,6 @@
-# Face and body representations converge along the visual hierarchy in models and cortex
+# Faces and bodies are increasingly integrated along the visual hierarchy in humans and deep neural networks
 
-This repository contains analysis code for the paper "Face and body representations converge along the visual hierarchy in models and cortex" by Leonard E. van Dyck and Katharina Dobs.
+This repository contains analysis code for the paper [*Faces and bodies are increasingly integrated along the visual hierarchy in humans and deep neural networks*](https://doi.org/10.64898/2026.02.16.706115) by Leonard E. van Dyck and Katharina Dobs.
 
 ## Installation
 ```
