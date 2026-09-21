@@ -1,11 +1,18 @@
+"""Localize face-, body-, and mixed-selective units in DNN with fMRI-style functional localizer, and validate them on a held-out image set."""
+
+import torch
+from torch.utils.data import DataLoader
 import numpy as np
 import scipy.stats as st
 from statsmodels.stats.multitest import multipletests
 from tqdm import tqdm
 from itertools import combinations
 
-from facebody.config import PROJECT_ROOT
-from myutils.utils import load_pickle, save_pickle
+from facebody.config import PROJECT_ROOT, DATA_ROOT
+from facebody.myutils.models import ModelLoader
+from facebody.myutils.feature_extractor import FeatureExtractor
+from facebody.myutils.nsd import NSDImageLoader, _nsd_img_worker_init
+from facebody.myutils.utils import load_pickle, save_pickle
 
 EPS = 1e-10
 
@@ -15,6 +22,7 @@ class DNNfloc:
     def __init__(self, model_name: str, layers: list,
                  class_to_idx: dict,
                  single_cats: list=None, mixed_tuples: list=None,
+                 solo_cats: list=None,
                  baseline_cat: str="object",
                  scrambled_cat: str="scrambled",
                  fdr_method: str="fdr_by", 
@@ -38,6 +46,7 @@ class DNNfloc:
         self.scrambled_idx = class_to_idx[scrambled_cat]
         self.single_cats = single_cats or [cat for cat in class_to_idx.keys() if cat != baseline_cat]
         self.mixed_tuples = mixed_tuples or list(combinations(self.single_cats, 2))
+        self.solo_cats = list(solo_cats or [])
         self.all_cats = list(class_to_idx.keys())
         self._validate_categories()
 
@@ -48,12 +57,22 @@ class DNNfloc:
         print(f"Model: {self.model_name}")
         print(f"Pure selectivity: {self.single_cats}")
         print(f"Mixed selectivity: {['&'.join(t) for t in self.mixed_tuples]}")
+        print(f"Solo selectivity: {self.solo_cats}")
 
     def _validate_categories(self):
         """Validate all single and mixed category definitions."""
-        invalid_cats = [cat for cat in self.single_cats if cat not in self.class_to_idx]
+        invalid_cats = [cat for cat in self.single_cats + self.solo_cats
+                        if cat not in self.class_to_idx]
         if invalid_cats:
             raise ValueError(f"Categories {invalid_cats} not found in class_to_idx")
+
+        overlap = set(self.solo_cats) & set(self.single_cats)
+        if overlap:
+            raise ValueError(f"Categories {sorted(overlap)} are in both single_cats and solo_cats")
+
+        reserved = {self.baseline_cat, self.scrambled_cat} & set(self.solo_cats)
+        if reserved:
+            raise ValueError(f"Categories {sorted(reserved)} cannot be used as solo_cats")
 
         for cat_tuple in self.mixed_tuples:
             if len(cat_tuple) < 2:
@@ -105,24 +124,25 @@ class DNNfloc:
         return (m1 - m2) / np.sqrt(s2_pooled)
 
     def _compute_pure_sel(self, grouped: dict, target_cat: str,
-                          competing_cat: str):
+                          competing_cat: str=None):
         """
         Test for pure selectivity using baseline approach.
 
+        All p-values are FDR-corrected across units: alpha_pos for the positive
+        criteria, alpha_neg for the negative ones.
+
         Example for face-selective (competing_cat=body, baseline=object):
-        1. faces > objects (p < 0.001)
-        2. faces > scrambled (p < 0.001)
-        3. faces > bodies (p < 0.001)
-        4. NOT bodies > objects (p > 0.01)
-        5. NOT scenes > objects (p > 0.01)
+        1. faces > objects (p < alpha_pos)
+        2. faces > scrambled (p < alpha_pos)
+        3. faces > bodies (p < alpha_pos) (only if a competing cat is given)
+        4. NOT bodies > objects (p >= alpha_neg)
+        5. NOT scenes > objects (p >= alpha_neg)
         """
         target_idx = self.class_to_idx[target_cat]
-        competing_idx = self.class_to_idx[competing_cat]
         baseline_idx = self.baseline_idx
         scrambled_idx = self.scrambled_idx
 
         target_group = grouped[target_idx]
-        competing_group = grouped[competing_idx]
         baseline_group = grouped[baseline_idx]
         scrambled_group = grouped[scrambled_idx]
 
@@ -138,11 +158,15 @@ class DNNfloc:
             self.fdr_method, self.alpha_pos
         )
 
-        # Positive criterion 3: target > competing
-        _, _, mask_target_vs_competing = self.ttest_onesided(
-            target_group, competing_group,
-            self.fdr_method, self.alpha_pos
-        )
+        # Positive criterion 3: target > competing (only if a rival is specified)
+        if competing_cat is None:
+            mask_target_vs_competing = np.ones(target_group.shape[1], dtype=bool)
+        else:
+            competing_group = grouped[self.class_to_idx[competing_cat]]
+            _, _, mask_target_vs_competing = self.ttest_onesided(
+                target_group, competing_group,
+                self.fdr_method, self.alpha_pos
+            )
 
         # Negative criteria: ALL other categories NOT > baseline
         # Other categories = all cats except target, baseline, and scrambled
@@ -182,12 +206,15 @@ class DNNfloc:
         """
         Test for mixed selectivity using baseline approach.
 
+        All p-values are FDR-corrected across units: alpha_pos for the positive
+        criteria, alpha_neg for the negative ones.
+
         Example for face&body-selective (baseline=object):
-        1. faces > objects (p < 0.001)
-        2. faces > scrambled (p < 0.001)
-        3. bodies > objects (p < 0.001)
-        4. bodies > scrambled (p < 0.001)
-        5. NOT scenes > objects (p > 0.05)
+        1. faces > objects (p < alpha_pos)
+        2. faces > scrambled (p < alpha_pos)
+        3. bodies > objects (p < alpha_pos)
+        4. bodies > scrambled (p < alpha_pos)
+        5. NOT scenes > objects (p >= alpha_neg)
         """
         if len(cat_tuple) != 2:
             raise ValueError("Mixed selectivity currently only supports 2-category tuples")
@@ -273,14 +300,20 @@ class DNNfloc:
         return {"is_exclusive": is_exclusive}
 
     def find_sel_units(self, activs: dict, labels: np.ndarray,
-                       check_exclusivity: bool=True):
+                       check_exclusivity: bool=True, out_name: str="floc_res"):
         """
         Identify selective units using baseline approach with mutual exclusivity.
 
-        For 2-category case (face, body) with baseline (object):
-        - Face-selective: face>object AND face>body AND NOT(body>object) AND NOT(others>object)
-        - Body-selective: body>object AND body>face AND NOT(face>object) AND NOT(others>object)
-        - Mixed-selective: face>object AND body>object AND NOT(others>object)
+        Runs with different single_cats/mixed_tuples must set different out_name,
+        or they overwrite each other's results.
+
+        For 2-category case (face, body) with baseline (object) and scrambled:
+        - Face-selective: face>object AND face>scrambled AND face>body
+          AND NOT(body>object) AND NOT(others>object)
+        - Body-selective: body>object AND body>scrambled AND body>face
+          AND NOT(face>object) AND NOT(others>object)
+        - Mixed-selective: face>object AND face>scrambled AND body>object
+          AND body>scrambled AND NOT(others>object)
         """
         res = {}
         excl_report = {}
@@ -294,71 +327,22 @@ class DNNfloc:
             unit_ids = {}
             stats_dict = {}
 
-            # For 2-category case, use special logic
+            # Test pure selectivity
             if len(self.single_cats) == 2:
                 cat1, cat2 = self.single_cats
-
-                # Cat1-selective
-                res_cat1 = self._compute_pure_sel(grouped, cat1, cat2)
-                unit_ids[cat1] = np.where(res_cat1["mask"])[0]
-
-                cat1_idx = self.class_to_idx[cat1]
-                dvals1 = self.dprime(X, y, cat1_idx)
-                stats_dict[cat1] = {"dvals": dvals1, "mask": res_cat1["mask"]}
-
-                # Cat2-selective
-                res_cat2 = self._compute_pure_sel(grouped, cat2, cat1)
-                unit_ids[cat2] = np.where(res_cat2["mask"])[0]
-
-                cat2_idx = self.class_to_idx[cat2]
-                dvals2 = self.dprime(X, y, cat2_idx)
-                stats_dict[cat2] = {"dvals": dvals2, "mask": res_cat2["mask"]}
-
+                pure_specs = [(cat1, cat2), (cat2, cat1)]
             else:
-                # General case: requires specifying competing pairs
-                # For simplicity, treat each category independently
-                for cat in self.single_cats:
-                    cat_idx = self.class_to_idx[cat]
-                    cat_group = grouped[cat_idx]
-                    baseline_group = grouped[self.baseline_idx]
-                    scrambled_group = grouped[self.scrambled_idx]
+                pure_specs = [(cat, None) for cat in self.single_cats]
+            pure_specs += [(cat, None) for cat in self.solo_cats]
 
-                    # Positive: cat > baseline AND cat > scrambled
-                    _, _, mask_vs_baseline = self.ttest_onesided(
-                        cat_group, baseline_group,
-                        self.fdr_method, self.alpha_pos
-                    )
-                    _, _, mask_vs_scrambled = self.ttest_onesided(
-                        cat_group, scrambled_group,
-                        self.fdr_method, self.alpha_pos
-                    )
-                    mask_pos = mask_vs_baseline & mask_vs_scrambled
+            for target_cat, competing_cat in pure_specs:
+                res_cat = self._compute_pure_sel(grouped, target_cat, competing_cat)
+                unit_ids[target_cat] = np.where(res_cat["mask"])[0]
 
-                    # Negative: all others NOT > baseline
-                    other_cats = [
-                        c for c in self.all_cats
-                        if c not in [cat, self.baseline_cat, self.scrambled_cat]
-                    ]
+                dvals = self.dprime(X, y, self.class_to_idx[target_cat])
+                stats_dict[target_cat] = {"dvals": dvals, "mask": res_cat["mask"]}
 
-                    mask_list_neg = []
-                    for other_cat in other_cats:
-                        other_idx = self.class_to_idx[other_cat]
-                        other_group = grouped[other_idx]
-                        
-                        _, pvals, _ = self.ttest_onesided(
-                            other_group, baseline_group,
-                            self.fdr_method, self.alpha_neg
-                        )
-                        mask_list_neg.append(pvals >= self.alpha_neg)
-
-                    mask_neg = np.stack(mask_list_neg, axis=0).all(axis=0)
-                    mask = mask_pos & mask_neg
-
-                    unit_ids[cat] = np.where(mask)[0]
-                    dvals = self.dprime(X, y, cat_idx)
-                    stats_dict[cat] = {"dvals": dvals, "mask": mask}
-
-            # Test mixed selectivity for each tuple
+            # Test mixed selectivity
             for cat_tuple in self.mixed_tuples:
                 tuple_name = self.mixed_tuple_names[cat_tuple]
                 res_mixed = self._compute_mixed_sel(grouped, cat_tuple)
@@ -401,15 +385,23 @@ class DNNfloc:
 
         save_dir = PROJECT_ROOT / "selectivity" / self.model_name
         save_dir.mkdir(parents=True, exist_ok=True)
-        fname = save_dir / "floc_res.pkl"
+        fname = save_dir / f"{out_name}.pkl"
         save_pickle(res, fname)
-        print(f"\nResults saved to: {save_dir / 'floc_res.pkl'}")
+        print(f"\nResults saved to: {fname}")
 
 
 # ----------------------------------- Utils ---------------------------------- #
 def filter_sel_activs(model_name: str, activs: dict, layer: str,
-                      n_top: int=None, controlled: bool=False, sort_nonsel_desc: str="mixed"):
-    """Get activations for all unit types in given layer."""
+                      n_top: int=None, controlled: bool=False,
+                      sort_nonsel_desc: str="mixed"):
+    """
+    Activations of each unit type in one layer, read from the saved fLoc results.
+
+    Selective types are sorted by descending d'. The non-selective group is every
+    remaining unit, sorted by ascending d' of `sort_nonsel_desc`.
+    With controlled=True all four groups are truncated to the size of the smallest
+    selective type.
+    """
     X = activs[layer]
     res = load_pickle(PROJECT_ROOT / "selectivity" / model_name / "floc_res.pkl")
     sel_ids = res[layer]["unit_ids"]
@@ -421,7 +413,6 @@ def filter_sel_activs(model_name: str, activs: dict, layer: str,
     for s in sel_types:
         ids = sel_ids[s]
         if ids.size:
-            # d = dvals[s]
             d = stats[s]["dvals"]
             sorted_ids[s] = ids[np.argsort(d[ids])[::-1]]
         else:
@@ -445,6 +436,24 @@ def filter_sel_activs(model_name: str, activs: dict, layer: str,
 
     return {s: X[:, sorted_ids[s]] for s in (*sel_types, "nonselective") if sorted_ids[s].size}
 
+def compute_sel_resp(model_name: str, activs: dict, labels: np.ndarray,
+                     class_to_idx: dict, img_db: str="validation"):
+    """Compute mean z-scored response of each unit to each category."""
+    res = {}
+    for layer, X in activs.items():
+        # z-score each unit across all images, then average within each category
+        unit_mean = X.mean(axis=0, dtype=np.float64)
+        unit_sd = X.std(axis=0, ddof=1, dtype=np.float64)
+        unit_sd = np.where(unit_sd > EPS, unit_sd, np.nan)
+
+        res[layer] = {
+            f"{cat}_z": ((X[labels == idx].mean(axis=0, dtype=np.float64) - unit_mean)
+                         / unit_sd).tolist()
+            for cat, idx in class_to_idx.items()
+        }
+
+    save_pickle(res, PROJECT_ROOT / "selectivity" / model_name / f"{img_db}_resp.pkl")
+
 def compute_sel_dprime(model_name: str, activs: dict, labels: np.ndarray,
                        class_to_idx: dict, img_db: str="validation",
                        baseline_cat: str=None):
@@ -462,7 +471,7 @@ def compute_sel_dprime(model_name: str, activs: dict, labels: np.ndarray,
             # One vs. all - direct usage
             dvals_f = DNNfloc.dprime(X, labels, face_idx)
             dvals_b = DNNfloc.dprime(X, labels, body_idx)
-            
+
             # Mixed: create binary labels (1=face/body, 0=others)
             y_mixed = ((labels == face_idx) | (labels == body_idx)).astype(int)
             dvals_m = DNNfloc.dprime(X, y_mixed, target=1)
@@ -491,59 +500,9 @@ def compute_sel_dprime(model_name: str, activs: dict, labels: np.ndarray,
 
     save_pickle(res, PROJECT_ROOT / "selectivity" / model_name / f"{img_db}_dprime.pkl")
 
-def print_floc_dprime_summary(model_name: str, layers: list,
-                              controlled: bool=True, n_top: int=None):
-    """Print mean +/- SD selectivity d' for each selective unit type per layer."""
-    res = load_pickle(PROJECT_ROOT / "selectivity" / model_name / "floc_res.pkl")
-    cats = ("face", "body", "mixed")
-
-    if layers is None:
-        layers = list(res.keys())
-
-    out = {}
-    for lay in layers:
-        sel_ids = res[lay]["unit_ids"]
-        dvals = res[lay]["dvals"]
-
-        # Sort unit ids within each type by that type's d' (descending)
-        sorted_ids = {}
-        for c in cats:
-            ids = np.array(sel_ids.get(c, []), dtype=int)
-            if ids.size:
-                d = np.asarray(dvals[c])
-                sorted_ids[c] = ids[np.argsort(d[ids])[::-1]]
-            else:
-                sorted_ids[c] = np.array([], dtype=int)
-
-        if controlled:
-            avail_counts = [len(sorted_ids[c]) for c in cats if len(sorted_ids[c]) > 0]
-            top = (n_top if n_top is not None else (min(avail_counts) if avail_counts else 0))
-            use_ids = {c: sorted_ids[c][:top] for c in cats}
-            hdr = f"=== Layer: {lay} (controlled: top {top} per type) ==="
-        else:
-            use_ids = sorted_ids
-            hdr = f"=== Layer: {lay} (uncontrolled: all units) ==="
-
-        print(f"\n{hdr}")
-        lay_out = {}
-        for c, label in (("face", "Face"), ("body", "Body"), ("mixed", "Mixed")):
-            ids = use_ids[c]
-            if ids.size == 0:
-                mu, sd, n = np.nan, np.nan, 0
-                print(f"{label:<5} d': — (n=0)")
-            else:
-                d = np.asarray(dvals[c])[ids]
-                mu = float(d.mean())
-                sd = float(d.std(ddof=1)) if d.size > 1 else 0.0
-                n = int(d.size)
-                print(f"{label:<5} d': {mu:.2f} ± {sd:.2f} (n={n})")
-            lay_out[c] = {"mean": mu, "sd": sd, "n": n}
-
-        out[lay] = lay_out
-
-def print_grand_floc_dprime_summary(model_name: str, layers: list=None,
-                                    controlled: bool=False, n_top: int=None,
-                                    method: str="units"):
+def stats_floc_dprime_summary(model_name: str, layers: list=None,
+                              controlled: bool=True, n_top: int=None,
+                              method: str="layer-mean"):
     """Compute grand mean ± SD d' per selective unit type across layers."""
     res = load_pickle(PROJECT_ROOT / "selectivity" / model_name / "floc_res.pkl")
     cats = ("face", "body", "mixed")
@@ -559,7 +518,6 @@ def print_grand_floc_dprime_summary(model_name: str, layers: list=None,
         if lay not in res:
             continue
         sel_ids = res[lay]["unit_ids"]
-        # dvals = res[lay]["dvals"]
         stats = res[lay]["stats"]
 
         # Sort by within-type d' (descending)
@@ -567,7 +525,6 @@ def print_grand_floc_dprime_summary(model_name: str, layers: list=None,
         for c in cats:
             ids = np.array(sel_ids.get(c, []), dtype=int)
             if ids.size:
-                # d_all = np.asarray(dvals[c])
                 d_all = np.asarray(stats[c]["dvals"])
                 sorted_ids[c] = ids[np.argsort(d_all[ids])[::-1]]
             else:
@@ -629,3 +586,60 @@ def print_grand_floc_dprime_summary(model_name: str, layers: list=None,
         else:
             print(f"{label:<5}: {s['mean']:.2f} ± {s['sd']:.2f} "
                   f"(layers={s['n_layers']}, units={s['n_units']})")
+
+def compute_mean_resp_nsd(model_dict: dict, device: str, nsd_ids: np.ndarray=None,
+                          batch_size: int=128, num_workers: int=16):
+    """
+    For each model, compute the mean response of each selectivity type to each
+    NSD image in the model's last layer.
+    """
+    nsd_h5_path = DATA_ROOT / "datasets" / "nsd" / "nsd_stimuli.hdf5"
+
+    if nsd_ids is None:
+        img_ids_by_subj = load_pickle(PROJECT_ROOT / "nsd" / "img_ids.pkl")
+        nsd_ids = np.concatenate([np.asarray(v) for v in img_ids_by_subj.values()])
+    nsd_ids = np.unique(np.asarray(nsd_ids, dtype=np.int64))
+
+    ds = NSDImageLoader(nsd_h5_path, nsd_ids, size=(224, 224))
+    dl = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=False,
+        worker_init_fn=_nsd_img_worker_init,
+    )
+
+    for model_name, layers in model_dict.items():
+        layer = layers[-1]
+        print(f"Processing {model_name} {layer}")
+
+        ml = ModelLoader(model_name, DATA_ROOT, device)
+        fe = FeatureExtractor(ml, [layer])
+        with torch.no_grad():
+            activs = fe.extract(dl, to_memory=True)[0]
+        if not isinstance(activs, dict):
+            activs = {layer: activs[0]}
+
+        activs_sel = filter_sel_activs(
+            model_name, activs, layer,
+            n_top=None,
+            controlled=True,
+        )
+
+        # Mean response per image per unit type
+        mean_resp = {
+            sel_type: X_sel.mean(axis=1)
+            for sel_type, X_sel in activs_sel.items()
+        }
+
+        out_path = (
+            PROJECT_ROOT / "nsd" / "models" / "mean_resp_sel" /
+            f"resp_{model_name}_{layer}.npy"
+        )
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(out_path, {"nsd_ids": nsd_ids, "mean_resp": mean_resp})
+        print(f"Saved → {out_path}")
+
+    ds.close()

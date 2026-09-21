@@ -1,3 +1,5 @@
+"""Extract and cache DNN activations for NSD images of each subject."""
+
 import pickle as pkl
 from dataclasses import dataclass
 from pathlib import Path
@@ -5,9 +7,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from myutils.models import ModelLoader
-from myutils.feature_extractor import FeatureExtractor
-from myutils.nsd import NSDImageLoader, _nsd_img_worker_init
+from facebody.myutils.models import ModelLoader
+from facebody.myutils.feature_extractor import FeatureExtractor
+from facebody.myutils.nsd import NSDImageLoader, _nsd_img_worker_init
 
 # --------------------------- NSD unit activations --------------------------- #
 class ActivationStore:
@@ -17,6 +19,7 @@ class ActivationStore:
         self._ram = {}
 
     def get(self, subj: str):
+        """Cached activations for one subject; raises if neither in RAM nor on disk."""
         if subj in self._ram:
             return self._ram[subj]
 
@@ -29,6 +32,7 @@ class ActivationStore:
         raise RuntimeError(f"Activations for {subj} not found in RAM or disk: {path}")
 
     def put(self, subj: str, activs: dict, save_to_disk: bool=False):
+        """Store one subject's activations in RAM, optionally also on disk."""
         self._ram[subj] = activs
         if save_to_disk:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -38,6 +42,7 @@ class ActivationStore:
 
 @dataclass(frozen=True)
 class ActivationExtractConfig:
+    """Batching and device settings for NSD activation pass."""
     layers: list
     batch_size: int = 128
     num_workers: int = 32
@@ -55,6 +60,7 @@ class NSDActivationExtractor:
     def extract_and_cache(self, subjects: list, img_ids_by_subj: dict,
                           act_store, pre_relu: bool=False,
                           save_to_disk: bool=False):
+        """One forward pass over the union of images, then one slice per subject."""
         sorted_ids = np.unique(np.concatenate([img_ids_by_subj[s] for s in subjects]))
 
         ds = NSDImageLoader(self.repo.nsd_stimuli_h5(), sorted_ids, size=(224, 224))

@@ -6,13 +6,13 @@ import torchvision
 from torchvision import transforms
 from pathlib import Path
 
-from myutils.models import AlexNetGN
+from facebody.myutils.models import AlexNetGN
 from facebody.config import DATA_ROOT
 
 # Projector index map (assuming projector: [Lin0, BN1, ReLU2, Lin3, BN4, ReLU5, Lin6])
 TAP2IDX = {"fc6": 0, "relu6": 2, "fc7": 3, "relu7": 5}
 
-# ---------------- Model pieces ----------------
+# ------------------------------- Model pieces ------------------------------- #
 class LinearProbe(nn.Module):
     def __init__(self, backbone: nn.Module, projector: nn.Sequential,
                  cut_idx: int, n_classes: int, bias: bool=False):
@@ -53,7 +53,7 @@ class LinearProbe(nn.Module):
         return self.readout(h)
 
 
-# ---------------- Loaders ----------------
+# ---------------------------------- Loaders --------------------------------- #
 def load_backbone(backbone_ckpt: Path):
     alex = AlexNetGN(in_channel=3, out_dim=128, l2norm=True)
     backbone = alex.backbone
@@ -78,7 +78,7 @@ def load_projector_if_any(projector_ckpt: Path):
     return proj
 
 
-# ---------------- Data ----------------
+# ----------------------------------- Data ----------------------------------- #
 def build_transforms():
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     train_tf = transforms.Compose(
@@ -124,7 +124,7 @@ def build_dataloaders(ecoset_root: Path, batch_size: int, num_workers: int, devi
     return train_loader, val_loader
 
 
-# ---------------- Loss / Metrics ----------------
+# ------------------------------ Loss / Metrics ------------------------------ #
 def sparse_ce_loss(logits: torch.Tensor, targets: torch.Tensor, readout_weight: torch.Tensor,
                    l1_pos: float, l1_neg: float, sparse_pos: bool):
     ce = F.cross_entropy(logits, targets)
@@ -142,7 +142,7 @@ def topk_acc(logits: torch.Tensor, y: torch.Tensor, k: int=1):
     return idx.eq(y.view(-1, 1)).any(dim=1).float().mean().item() * 100.0
 
 
-# ---------------- Train / Eval loops ----------------
+# ------------------------------- Train / Eval ------------------------------- #
 def train_one_epoch(model: nn.Module, loader: DataLoader, opt: torch.optim.Optimizer,
                     scaler: "torch.amp.GradScaler", device: torch.device, device_type: str,
                     sched: torch.optim.lr_scheduler._LRScheduler, l1_pos: float, l1_neg: float,
@@ -198,7 +198,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, device_
 # ------------------------------------ Run ----------------------------------- #
 def train_readout(
     # Data / paths
-    ecoset_root: Path=Path("/raid/shared/datasets/visoin/ecoset/"),
+    ecoset_root: Path=DATA_ROOT / "datasets" / "ecoset",
     backbone_ckpt: Path=DATA_ROOT / "models" / "alexnet-barlow-twins_ecoset" / "checkpoint" / "alexnet-barlow-twins_ecoset.pt",
     projector_ckpt: Path=DATA_ROOT / "models" / "alexnet-barlow-twins_ecoset" / "projector.pt",
     save_path: Path=DATA_ROOT / "models" / "alexnet-barlow-twins_ecoset" / "state_dict_readout.pt",

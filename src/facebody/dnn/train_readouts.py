@@ -1,3 +1,5 @@
+"""Train linear readouts on frozen DNN features for face, person, and action tasks used by lesioning analysis."""
+
 import json
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -7,10 +9,10 @@ from torch import nn, optim
 from torch.utils.data import Subset, DataLoader
 from torchvision import datasets
 
-from myutils.models import ModelLoader
-from myutils.dataset import BboxCroppedImageDataset
-from myutils.utils import get_imagenet_transform
 from facebody.config import DATA_ROOT, PROJECT_ROOT
+from facebody.myutils.models import ModelLoader
+from facebody.myutils.dataset import BboxCroppedImageDataset
+from facebody.myutils.utils import get_imagenet_transform
 
 EPS = 1e-10
 
@@ -25,7 +27,7 @@ TASK_CONFIGS = {
     "face": dict(
         spec=DatasetSpec(
             kind="imagefolder",
-            root="/raid/shared/datasets/visoin/VGGFace2/test/",
+            root=str(DATA_ROOT / "datasets" / "VGGFace2" / "test"),
         ),
         top_k=5,
     ),
@@ -317,7 +319,7 @@ def train_task_readout(model_name: str, feature_layer: str, device: str,
 
 def load_task_readout(out_dir: Path, device: str, batch_size: int=32,
                       n_workers: int=4):
-    """Load trained readout with data loaders."""
+    """Load trained readout."""
     out_dir = Path(out_dir)
     with (out_dir / "linear_readout_metadata.json").open("r") as f:
         meta = json.load(f)
@@ -340,7 +342,7 @@ def load_task_readout(out_dir: Path, device: str, batch_size: int=32,
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
                             num_workers=n_workers, pin_memory=True)
 
-    ml = ModelLoader(meta["model_name"], DATA_ROOT=DATA_ROOT, device=device)
+    ml = ModelLoader(meta["model_name"], data_dir=DATA_ROOT, device=device)
     extractor = FeatureExtractor(ml, meta["feature_layer"], device)
 
     classifier = nn.Linear(extractor.feature_dim, len(classes)).to(device)
