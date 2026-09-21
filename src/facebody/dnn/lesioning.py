@@ -1,19 +1,23 @@
+"""Lesion each unit type in a trained network and measure the drop in task accuracy."""
+
 from itertools import combinations
+from pathlib import Path
 import numpy as np
 import torch
 
 from facebody.config import PROJECT_ROOT
-from facebody.train_readouts import (
+from .train_readouts import (
     TASK_CONFIGS, READOUT_CONFIGS,
-    train_task_readout, load_task_readout
+    train_task_readout, load_task_readout,
 )
-from myutils.utils import save_pickle, load_pickle, seed_everything
+from facebody.myutils.utils import save_pickle, load_pickle, seed_everything
 
 # ------------------------------- Bootstrap ---------------------------------- #
 class BootstrapAnalyzer:
-    """Handles bootstrap confidence intervals for lesioning analysis."""
-    def __init__(self, n_iter: int=10000):
+    """Bootstrap confidence intervals for the lesioning analysis."""
+    def __init__(self, n_iter: int=10000, seed: int=0):
         self.n_iter = n_iter
+        self.seed = seed
 
     def mean_ci(self, values: np.ndarray, seed: int=0):
         """Bootstrap CI for mean."""
@@ -27,7 +31,7 @@ class BootstrapAnalyzer:
             boot_means[i] = values[idx].mean()
 
         ci_low, ci_high = np.percentile(boot_means, [2.5, 97.5])
-        return values.mean(), ci_low, ci_high, boot_means
+        return values.mean(), ci_low, ci_high
 
     def drop_ci(self, base_flags: np.ndarray, les_flags: np.ndarray,
                 rng=None):
@@ -37,7 +41,7 @@ class BootstrapAnalyzer:
         assert base_flags.shape == les_flags.shape
 
         N = base_flags.shape[0]
-        rng = np.random.default_rng() if rng is None else rng
+        rng = np.random.default_rng(self.seed) if rng is None else rng
 
         drops = np.empty(self.n_iter, dtype=float)
         for i in range(self.n_iter):
@@ -56,8 +60,8 @@ class BootstrapAnalyzer:
         assert base_flags.shape == flags_a.shape == flags_b.shape
 
         N = base_flags.shape[0]
-        rng = np.random.default_rng() if rng is None else rng
-        
+        rng = np.random.default_rng(self.seed) if rng is None else rng
+
         diffs = np.empty(self.n_iter, dtype=float)
         for i in range(self.n_iter):
             idx = rng.integers(0, N, size=N)
@@ -70,12 +74,13 @@ class BootstrapAnalyzer:
         return diffs.mean(), lo, hi, float(p)
     
     def hierarch_drop(self, splits_data: list):
-        """Hierarchical bootstrap across splits."""
+        """Hierarchical bootstrap across splits, then across images within a split."""
+        rng = np.random.default_rng(self.seed)
         n_splits = len(splits_data)
         boot_drops = []
 
         for _ in range(self.n_iter):
-            sampled_indices = np.random.choice(n_splits, size=n_splits, replace=True)
+            sampled_indices = rng.choice(n_splits, size=n_splits, replace=True)
             resampled_drops = []
 
             for split_idx in sampled_indices:
@@ -84,7 +89,7 @@ class BootstrapAnalyzer:
                 les = split_data["lesioned_flags"]
 
                 n_imgs = len(base)
-                img_indices = np.random.choice(n_imgs, size=n_imgs, replace=True)
+                img_indices = rng.choice(n_imgs, size=n_imgs, replace=True)
                 split_drop = base[img_indices].mean() - les[img_indices].mean()
                 resampled_drops.append(split_drop)
 
@@ -121,7 +126,8 @@ class BootstrapAnalyzer:
             drop_b = base_b.mean() - les_b.mean()
             split_drops_b.append(drop_b)
 
-        # Compute Cohen's d from split-level differences
+        # Cohen's d from the split-level differences. Uses no RNG, so it cannot
+        # perturb the bootstrap below.
         split_drops_a = np.array(split_drops_a)
         split_drops_b = np.array(split_drops_b)
         split_diffs = split_drops_a - split_drops_b
@@ -131,9 +137,10 @@ class BootstrapAnalyzer:
         cohens_d = mean_diff_observed / sd_diff if sd_diff > 0 else np.nan
 
         # Hierarchical bootstrap for CI
+        rng = np.random.default_rng(self.seed)
         boot_diffs = []
         for _ in range(self.n_iter):
-            sampled_indices = np.random.choice(n_splits, size=n_splits, replace=True)
+            sampled_indices = rng.choice(n_splits, size=n_splits, replace=True)
             drops_a, drops_b = [], []
 
             for split_idx in sampled_indices:
@@ -141,7 +148,7 @@ class BootstrapAnalyzer:
                 base_a = split_a['baseline_flags']
                 les_a = split_a['lesioned_flags']
                 n_imgs = len(base_a)
-                img_idx = np.random.choice(n_imgs, size=n_imgs, replace=True)
+                img_idx = rng.choice(n_imgs, size=n_imgs, replace=True)
                 drops_a.append(base_a[img_idx].mean() - les_a[img_idx].mean())
 
                 split_b = splits_data_b[split_idx]
@@ -163,15 +170,13 @@ class BootstrapAnalyzer:
 class LesioningAnalyzer:
     """Lesion selective units and measure accuracy drops."""
     def __init__(self, model_loader, classifier, extract_feats, test_loader,
-                 lesion_scheme: str="controlled", top_k: int=5,
-                 device: str="cuda"):
+                 top_k: int=5, device: str="cuda"):
         self.model_loader = model_loader
         self.model_name = model_loader.model_name
         self.backbone = model_loader.model.to(device).eval()
         self.classifier = classifier.to(device).eval()
         self.extract_feats = extract_feats
         self.test_loader = test_loader
-        self.lesion_scheme = lesion_scheme
         self.top_k = top_k
         self.device = torch.device(device)
         self.hooks = {}
@@ -197,6 +202,7 @@ class LesioningAnalyzer:
         }
 
         def _sorted_selective_ids(s):
+            """Unit ids of type s, sorted by descending d' of that type."""
             ids = sel_ids_by_type[s]
             if ids.size == 0:
                 return ids
@@ -219,7 +225,7 @@ class LesioningAnalyzer:
 
             dvals_nonsel = d_mixed[nonsel_units]
             sorted_nonsel = nonsel_units[np.argsort(dvals_nonsel)]
-            return self._apply_lesion_scheme(sorted_nonsel, sel_ids_by_type)
+            return self._match_unit_counts(sorted_nonsel, sel_ids_by_type)
 
         sel_units = sel_ids_by_type.get(sel, None)
         if sel_units is None or sel_units.size == 0:
@@ -227,28 +233,16 @@ class LesioningAnalyzer:
             return None
 
         unit_ids = _sorted_selective_ids(sel)
-        return self._apply_lesion_scheme(unit_ids, sel_ids_by_type)
+        return self._match_unit_counts(unit_ids, sel_ids_by_type)
 
-    def _apply_lesion_scheme(self, unit_ids: np.ndarray, sel_ids_by_type: dict):
-        """Apply lesion scheme (all/controlled/topX%)."""
+    def _match_unit_counts(self, unit_ids: np.ndarray, sel_ids_by_type: dict):
+        """Truncate to the size of the smallest selective type."""
         unit_ids = np.asarray(unit_ids, dtype=int)
-
-        if self.lesion_scheme == "all":
+        counts = [sel_ids_by_type[s].size for s in ["face", "body", "mixed"]
+                  if sel_ids_by_type[s].size > 0]
+        if not counts:
             return unit_ids
-
-        if self.lesion_scheme == "controlled":
-            counts = [sel_ids_by_type[s].size for s in ["face", "body", "mixed"]
-                     if sel_ids_by_type[s].size > 0]
-            if not counts:
-                return unit_ids
-            return unit_ids[:min(counts)]
-
-        if self.lesion_scheme.startswith("top") and self.lesion_scheme.endswith("%"):
-            perc = float(self.lesion_scheme[3:-1]) / 100.0
-            n_lesion = max(1, int(unit_ids.size * perc))
-            return unit_ids[:n_lesion]
-
-        raise ValueError(f"Unknown lesion_scheme: {self.lesion_scheme}")
+        return unit_ids[:min(counts)]
 
     def apply_hooks(self, lesion_ids_by_layer: dict):
         """Apply hooks to zero out units in specified layers."""
@@ -293,7 +287,7 @@ class LesioningAnalyzer:
     def run_lesioning_global(self,
                              sel_types: tuple=("face", "body", "mixed", "nonselective"),
                              layers=None):
-        """Run lesioning analysis across all layers."""
+        """Lesion each unit type across layers and measure the top-k accuracy drop."""
         self.remove_hooks()
 
         baseline_flags = self.eval_topk_flags(self.test_loader)
@@ -311,7 +305,7 @@ class LesioningAnalyzer:
 
         lesioned_flags_by_sel = {}
         for sel in sel_types:
-            print(f"Lesioning {sel}-selective units (scheme={self.lesion_scheme}) ...")
+            print(f"Lesioning {sel}-selective units ...")
 
             lesion_ids_by_layer = self._collect_lesion_units(sel, target_layers)
             if not lesion_ids_by_layer:
@@ -352,7 +346,7 @@ class LesioningAnalyzer:
 
     def _compute_pairwise(self, baseline_flags: np.ndarray,
                           lesioned_flags_by_sel: dict):
-        """Compute pairwise comparisons between selectivity types."""
+        """Compute pairwise comparisons between unit types."""
         pairwise = {}
         names = list(lesioned_flags_by_sel.keys())
 
@@ -377,7 +371,7 @@ def summarize_baseline_across_repeats(res: list):
     """Summarize baseline performance across splits."""
     bootstrap = BootstrapAnalyzer()
     baselines = np.array([r["baseline_topk"] for r in res], dtype=float)
-    mean_base, ci_low, ci_high, _ = bootstrap.mean_ci(baselines)
+    mean_base, ci_low, ci_high = bootstrap.mean_ci(baselines)
     return dict(
         mean=float(mean_base),
         std=float(baselines.std(ddof=1)),
@@ -387,7 +381,7 @@ def summarize_baseline_across_repeats(res: list):
     )
 
 def summarize_single_type_hierarch(res: list, sel: str):
-    """Summarize drops for one selectivity type with hierarchical bootstrap."""
+    """Summarize drops for one unit type with hierarchical bootstrap."""
     bootstrap = BootstrapAnalyzer()
     splits_data = [
         {
@@ -444,10 +438,10 @@ def summarize_pairwise_hierarch(res: list):
         if not splits_a:
             continue
 
-        # Absolute - now captures Cohen's d
+        # Absolute
         mean_abs, lo_abs, hi_abs, p_abs, d_abs = bootstrap.hierarch_paired(splits_a, splits_b)
 
-        # Relative - now captures Cohen's d
+        # Relative
         splits_a_rel = [{'baseline_flags': s['baseline_flags'] / s['baseline_acc'],
                         'lesioned_flags': s['lesioned_flags'] / s['baseline_acc']}
                        for s in splits_a]
@@ -478,44 +472,50 @@ def summarize_repeated_lesioning(res: list):
     )
     return summary
 
-def print_lesioning_summary(model_name: str, task: str):
-    """Pretty-print lesioning summary."""
-    path = PROJECT_ROOT / "lesioning" / model_name / task / "lesion_global.pkl"
+def report_lesioning(model_name: str, task: str, use: str="rel",
+                     proj_dir: Path=PROJECT_ROOT, n_iter: int=10000,
+                     method: str="fdr_bh"):
+    """Print lesioning table (FDR-corrected)."""
+    from statsmodels.stats.multitest import multipletests
+
+    path = Path(proj_dir) / "lesioning" / model_name / task / "lesion_global.pkl"
     summary = load_pickle(path)["summary"]
-
     base = summary["baseline"]
-    print("Baseline performance across splits:")
-    print(f"  M={base['mean']*100:.2f}, SD={base['std']*100:.2f}, "
+
+    floor = 2.0 / n_iter
+    fmt_p = lambda p: f"<{floor:.4f}" if p <= floor else f"{p:.3f}"
+
+    print(f"\n=== {task} | {use} | {method} within task ===")
+    print(f"  baseline: M={base['mean']*100:.2f}, SD={base['std']*100:.2f}, "
           f"CI=[{base['ci_low']*100:.2f}, {base['ci_high']*100:.2f}], "
-          f"n_repeats={base['n_repeats']}")
+          f"n_splits={base['n_repeats']}")
 
-    print("\nLesioning drops by unit type:")
-    for sel, comp in summary["per_sel"].items():
-        if comp is None:
-            continue
-        abs_s, rel_s = comp["abs"], comp["rel"]
-        print(f"  {sel:12s}: abs Δdrop={abs_s['mean_drop']*100:.2f}"
-              f"[{abs_s['ci_low']*100:.2f}, {abs_s['ci_high']*100:.2f}], p={abs_s['p_two_sided']:.3f}; "
-              f"rel Δdrop={rel_s['mean_drop']*100:.2f}% of baseline "
-              f"[{rel_s['ci_low']*100:.2f}, {rel_s['ci_high']*100:.2f}], p={rel_s['p_two_sided']:.3f}")
+    sels = [k for k, v in summary["per_sel"].items() if v is not None]
+    if sels:
+        p_corr = multipletests([summary["per_sel"][k][use]["p_two_sided"] for k in sels],
+                               alpha=0.05, method=method)[1]
+        print("\n  Accuracy drop by unit type:")
+        for k, pc in zip(sels, p_corr):
+            d = summary["per_sel"][k][use]
+            print(f"    {k:12s} drop={d['mean_drop']*100:.2f} "
+                  f"[{d['ci_low']*100:.2f}, {d['ci_high']*100:.2f}]  "
+                  f"p={fmt_p(pc)} (raw {fmt_p(d['p_two_sided'])})")
 
-    print("\nPairwise differences:")
-    for (a, b), comp in summary["pairwise"].items():
-        abs_s, rel_s = comp["abs"], comp["rel"]
-        d_abs_str = f"{abs_s['cohens_d']:.2f}" if np.isfinite(abs_s['cohens_d']) else "--"
-        d_rel_str = f"{rel_s['cohens_d']:.2f}" if np.isfinite(rel_s['cohens_d']) else "--"
-
-        print(f"  {a:8s} vs {b:8s}: abs Δdrop={abs_s['mean_diff']*100:.2f}"
-              f"[{abs_s['ci_low']*100:.2f}, {abs_s['ci_high']*100:.2f}], "
-              f"d={d_abs_str}, p={abs_s['p_two_sided']:.3f}; "
-              f"rel Δdrop={rel_s['mean_diff']*100:.4f}% "
-              f"[{rel_s['ci_low']*100:.2f}, {rel_s['ci_high']*100:.2f}], "
-              f"d={d_rel_str}, p={rel_s['p_two_sided']:.3f}")
+    pairs = list(summary["pairwise"])
+    if pairs:
+        p_corr = multipletests([summary["pairwise"][p][use]["p_two_sided"] for p in pairs],
+                               alpha=0.05, method=method)[1]
+        print("\n  Pairwise differences:")
+        for (a, b), pc in zip(pairs, p_corr):
+            c = summary["pairwise"][(a, b)][use]
+            print(f"    {a:8s} vs {b:8s} dM={c['mean_diff']*100:.2f} pp "
+                  f"[{c['ci_low']*100:.2f}, {c['ci_high']*100:.2f}]  "
+                  f"p={fmt_p(pc)} (raw {fmt_p(c['p_two_sided'])})")
 
 
 # -------------------------- Run lesioning analysis -------------------------- #
-def run_lesioning_analysis(model_name: str, readout_layer: str, device: str,
-                           task: str, base_seed: int=0, n_repeats: int=10):
+def run_lesioning_analysis(model_name: str, readout_layer: str, task: str,
+                           device: str, base_seed: int=0, n_repeats: int=10):
     """Run repeated CV lesioning analysis for a task."""
     if task not in TASK_CONFIGS:
         raise ValueError(f"Unknown task: {task}")
@@ -552,7 +552,6 @@ def run_lesioning_analysis(model_name: str, readout_layer: str, device: str,
             classifier=readout["classifier"],
             extract_feats=readout["extract_feats"],
             test_loader=readout["test_loader"],
-            lesion_scheme="controlled",
             top_k=top_k,
             device=device,
         )
@@ -566,6 +565,5 @@ def run_lesioning_analysis(model_name: str, readout_layer: str, device: str,
     save_pickle(dict(repeats=res, summary=summary), out_dir / "lesion_global.pkl")
 
     print(f"\n=== Summary for task='{task}' ===")
-    print_lesioning_summary(model_name, task)
 
     return res, summary

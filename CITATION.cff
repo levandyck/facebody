@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+title: >-
+  Analysis code for "Faces and bodies are increasingly integrated along the visual
+  hierarchy in humans and deep neural networks"
+message: If you use this software, please cite both the software and the paper.
+type: software
+authors:
+  - family-names: van Dyck
+    given-names: Leonard E.
+  - family-names: Dobs
+    given-names: Katharina
+repository-code: https://github.com/levandyck/facebody
+license: MIT
+preferred-citation:
+  type: article
+  title: >-
+    Faces and bodies are increasingly integrated along the visual hierarchy in humans
+    and deep neural networks
+  authors:
+    - family-names: van Dyck
+      given-names: Leonard E.
+    - family-names: Dobs
+      given-names: Katharina
+  doi: 10.64898/2026.02.16.706115
+  year: 2026

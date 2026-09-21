@@ -1,3 +1,5 @@
+"""Joblib wrapper with one progress bar and single-threaded workers."""
+
 import os
 from dataclasses import dataclass
 from joblib import Parallel, delayed, parallel_backend
@@ -7,6 +9,7 @@ from tqdm_joblib import tqdm_joblib
 # ---------------------------- Parallel processing --------------------------- #
 @dataclass(frozen=True)
 class ParallelConfig:
+    """Worker count and joblib batch size."""
     max_proc: int = 64
     batch_size: int = 8
 

@@ -21,9 +21,8 @@ import torch
 import torchvision
 import torchvision.transforms as transforms
 
-from myutils.models import AlexNetGN
-
-from facebody.config import raid_dir
+from facebody.config import DATA_ROOT
+from facebody.myutils.models import AlexNetGN
 
 parser = argparse.ArgumentParser(description='Barlow Twins Training')
 parser.add_argument('data', type=Path, metavar='DIR',
@@ -46,8 +45,9 @@ parser.add_argument('--projector', default='4096-4096-4096', type=str, # origina
                     metavar='MLP', help='projector MLP')
 parser.add_argument('--print-freq', default=100, type=int, metavar='N',
                     help='print frequency')
-parser.add_argument('--checkpoint-dir', default=raid_dir / 'models' / 'alexnet-barlow-twins_ecoset' / 'checkpoint', type=Path,
+parser.add_argument('--checkpoint-dir', default=DATA_ROOT / 'models' / 'alexnet-barlow-twins_ecoset' / 'checkpoint', type=Path,
                     metavar='DIR', help='path to checkpoint directory')
+
 
 # ----------------------------------- Model ---------------------------------- #
 class BarlowTwinsAlexNet(nn.Module):
@@ -92,6 +92,7 @@ class BarlowTwinsAlexNet(nn.Module):
         off_diag = off_diagonal(c).pow_(2).sum()
         loss = on_diag + self.lambd * off_diag
         return loss
+
 
 # --------------------------------- Training --------------------------------- #
 def main():
@@ -343,13 +344,10 @@ class Transform:
         y2 = self.transform_prime(x)
         return y1, y2
 
-if __name__ == '__main__':
-    main()
-
 
 # ---------------------------------- Helpers --------------------------------- #
-def export_projector(ckpt_path: Path=raid_dir / "models" / "alexnet-barlow-twins_ecoset" / "checkpoint" / "checkpoint.pth",
-                     out_path: Path=raid_dir / "models" / "alexnet-barlow-twins_ecoset" / "projector.pth"):
+def export_projector(ckpt_path: Path=DATA_ROOT / "models" / "alexnet-barlow-twins_ecoset" / "checkpoint" / "checkpoint.pth",
+                     out_path: Path=DATA_ROOT / "models" / "alexnet-barlow-twins_ecoset" / "projector.pth"):
     sd = torch.load(ckpt_path, map_location="cpu")
     full = sd["model"] if "model" in sd else sd
 
@@ -371,3 +369,6 @@ def export_projector(ckpt_path: Path=raid_dir / "models" / "alexnet-barlow-twins
 
     torch.save({"projector": proj_sd, "sizes": sizes}, out_path)
     print(f"Saved projector to: {out_path}, sizes={sizes}")
+
+if __name__ == '__main__':
+    main()

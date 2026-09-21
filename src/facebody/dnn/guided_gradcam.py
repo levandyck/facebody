@@ -1,3 +1,5 @@
+"""Guided Grad-CAM saliency maps driven by the units of one selectivity type."""
+
 from pathlib import Path
 import random
 from dataclasses import dataclass
@@ -8,14 +10,17 @@ import torch.nn as nn
 from torchvision import transforms
 
 from facebody.config import DATA_ROOT, PROJECT_ROOT
-from myutils.models import ModelLoader
-from myutils.feature_visualization import GuidedGradCAM
-from myutils.utils import load_pickle, seed_everything
+from facebody.myutils.models import ModelLoader
+from facebody.myutils.feature_visualization import GuidedGradCAM
+from facebody.myutils.utils import load_pickle, seed_everything
 
 DEFAULT_TRANSFORM = transforms.Compose([
     transforms.Resize(224),
     transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    transforms.Normalize(
+        [0.485, 0.456, 0.406],
+        [0.229, 0.224, 0.225]
+    ),
 ])
 
 # ------------------------------ Unit selection ------------------------------ #
@@ -75,7 +80,12 @@ def _apply_controlled_matching(by_type: dict, sel_types: tuple):
     return by_type
 
 def sort_ids_layer(model_name: str, layer: str, controlled: bool, sel_types: tuple):
-    """Load fLoc results, sort units by d', and add nonselective units."""
+    """
+    Unit ids per type for one layer, sorted by d'.
+
+    Selective types are sorted by descending d' of their own type; the non-selective
+    remainder is sorted by ascending d' of the reference type (mixed, when present).
+    """
     floc_res = load_pickle(PROJECT_ROOT / "selectivity" / model_name / "floc_res.pkl")
     sel_ids = floc_res[layer]["unit_ids"]
     stats = floc_res[layer]["stats"]
@@ -119,6 +129,22 @@ def norm_stack_inplace(maps: dict):
     rng = (gmax - gmin) if gmax > gmin else 1.0
     for k in maps:
         maps[k] = ((maps[k] - gmin) / rng).astype(np.float32)
+
+def normalize_maps(maps: dict, mode: str="per_type", pct: float=99):
+    """Return a rescaled copy of a {sel_type: heatmap} dict."""
+    if mode == "joint":
+        out = dict(maps)
+        norm_stack_inplace(out)
+        return out
+    if mode != "per_type":
+        raise ValueError(f"mode must be 'per_type' or 'joint', got {mode!r}")
+
+    out = {}
+    for k, m in maps.items():
+        m = m.astype(np.float32) - float(m.min())
+        hi = float(np.percentile(m, pct))
+        out[k] = np.clip(m / (hi if hi > 0 else 1.0), 0.0, 1.0)
+    return out
 
 class LayerResolver:
     """Resolve pretty layer names."""
@@ -164,6 +190,7 @@ class ImageSampler:
 
 @dataclass(frozen=True)
 class GuidedGradCAMAnalyzer:
+    """Run Guided Grad-CAM for each unit type on a sample of images."""
     model_name: str
     target_layer_pretty: str
     cam_layer_pretty: str
@@ -178,6 +205,7 @@ class GuidedGradCAMAnalyzer:
     seed: int
 
     def run(self):
+        """One entry per image: the image itself and its heatmap per unit type."""
         seed_everything(self.seed)
 
         ml = ModelLoader(self.model_name, DATA_ROOT, self.device)
@@ -221,6 +249,7 @@ class GuidedGradCAMAnalyzer:
         return res
 
     def _compute_heatmaps_for_image(self, ggc: GuidedGradCAM, img_tensor: torch.Tensor, sel_by_type: dict):
+        """Heatmap per unit type for one image, each driven by that type's units."""
         heatmaps = {}
         for sel in self.sel_types:
             sel_ids = sel_by_type[sel]
@@ -246,7 +275,7 @@ def compute_guided_gradcam(
     alpha: float=0.7,
     post_blur_sigma: float=3.0,
     seed: int=0,
-):
+    ):
     """Generate Guided-GradCAM saliency maps for each unit type."""
     runner = GuidedGradCAMAnalyzer(
         model_name=model_name,

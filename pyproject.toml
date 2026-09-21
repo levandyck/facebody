@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "facebody"
 version = "0.1.0"
-description = "Face/body analyses"
+description = "Face and body representations in deep neural networks and human visual cortex"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -24,9 +24,11 @@ dependencies = [
   "Pillow",
   "nibabel",
   "requests",
-  "PyYAML",
-  "myutils @ git+https://github.com/levandyck/myutils",
 ]
+
+[project.optional-dependencies]
+fmri = ["nilearn"]
+flatmaps = ["pycortex"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
